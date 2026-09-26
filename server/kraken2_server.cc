@@ -265,7 +265,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
                 if (opts.max_queue < 0) {
                     std::cerr << "Number of maximum concurrent requests cannot be less than 1 (0 for default)."
                               << std::endl;
-                    exit(0);
+                    exit(EX_USAGE);
                 }
                 break;
             case 'x':
@@ -290,7 +290,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
                 opts.port = atoi(optarg);
                 if (opts.port < 0 || opts.port > 65535) {
                     std::cerr << "Port number not valid (0 - 65535)" << std::endl;
-                    exit(0);
+                    exit(EX_USAGE);
                 }
                 break;
             case 'k':
@@ -310,7 +310,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
                 opts.confidence_threshold = atof(optarg);
                 if (opts.confidence_threshold < 0 || opts.confidence_threshold > 1) {
                     std::cerr << "Confidence threshold is not valid (0 - 1)" << std::endl;
-                    exit(0);
+                    exit(EX_USAGE);
                 }
                 break;
             case 'q':
@@ -318,7 +318,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
                 opts.minimum_quality_score = atoi(optarg);
                 if (opts.minimum_quality_score < 0) {
                     std::cerr << "Minimum quality score is not valid (> 0)" << std::endl;
-                    exit(0);
+                    exit(EX_USAGE);
                 }
                 break;
             case 'g':
@@ -326,7 +326,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
                 opts.minimum_hit_groups = atoi(optarg);
                 if (opts.minimum_hit_groups < 0) {
                     std::cerr << "Minimum hit groups is not valid (> 0)" << std::endl;
-                    exit(0);
+                    exit(EX_USAGE);
                 }
                 break;
             case 'o':
@@ -340,7 +340,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
     }
     if (opts.db_path.empty()) {
         std::cerr << "You must specify the path to the Kraken 2 database." << std::endl;
-        Usage(0);
+        Usage(EX_USAGE);
     }
 }
 

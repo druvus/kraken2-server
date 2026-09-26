@@ -1,7 +1,6 @@
-#ifndef KRAKEN2_REPORTS_H_
-#define KRAKEN2_REPORTS_H_
+#ifndef KRAKEN2_SERVER_REPORTS_H_
+#define KRAKEN2_SERVER_REPORTS_H_
 
-#include "report_server.h"
 #include "kraken2_headers.h"
 #include "taxonomy.h"
 #include "kraken2_data.h"

@@ -486,7 +486,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
             if (opts.port < 0 || opts.port > 65535)
             {
                 std::cerr << "Port number not valid (0 - 65535)" << std::endl;
-                exit(0);
+                exit(EX_USAGE);
             }
             break;
         }

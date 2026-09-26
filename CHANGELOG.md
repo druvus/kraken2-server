@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fast client cannot make the server hold its whole input in memory.
 - The conda recipe and CI use the conda-forge `libgrpc` and `libprotobuf`
   packages instead of building gRPC from source.
+- CI compiles and smoke tests the server and client on every push.
+- Usage errors on the command line exit with status 64 (`EX_USAGE`) instead
+  of 0.
+### Removed
+- The unused `thread_pool_light.hpp`. The unused proto fields `header`,
+  `str_representation` and `name` are marked deprecated but kept for
+  compatibility.
 ### Fixed
 - A FASTQ record whose quality string length differs from its sequence, with
   `--min-quality` set, is reported as unclassified instead of terminating the

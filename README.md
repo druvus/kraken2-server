@@ -64,15 +64,18 @@ The project can be built with `cmake` >3.13 and a C++17 compiler.
 
 The Kraken2 sources are included as a git submodule (`kraken2/`, pinned to
 upstream commit `01fb1d9`, Kraken 2.17.2) and are compiled into the server.
-Fetch the submodule before building:
+Clone with submodules, or fetch them afterwards:
 
 ```
+git clone --recurse-submodules https://github.com/epi2me-labs/kraken2-server.git
+cd kraken2-server
+# or, in an existing clone:
 git submodule update --init
 ```
 
-The server-client architecture uses gRPC and protobuf to communicate. An
-installation of gRPC (with protobuf is required). On a workstation the
-conda-forge packages are sufficient, for example:
+The server-client architecture uses gRPC and protobuf to communicate. The
+recommended way to obtain them is the conda-forge `libgrpc` and `libprotobuf`
+packages, which is also what the conda recipe in `conda/` and the CI use:
 
 ```
 mamba create -n k2build -c conda-forge cmake libgrpc libprotobuf zlib llvm-openmp cxx-compiler make
@@ -82,28 +85,32 @@ cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release ..
 make -j 8
 ```
 
+The server and client executables are written to:
+
+```
+build/server/kraken2_server
+build/client/kraken2_client
+```
+
 Note that the older `grpc-cpp` conda package pins a protobuf without CMake
-configuration files and does not work here. The conda recipe in `conda/`
-uses the same packages; `conda build conda/` produces the package that the
-conda channel distributes.
+configuration files and does not work here. `conda build conda/` produces
+the package that the conda channel distributes.
 
-Alternatively gRPC can be built from source as follows.
+### Fallback: building gRPC from source
 
-The following should be sufficient to setup an installation of gRPC
-and protobuf (see [gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp/quickstart/)):
+If conda is not an option, gRPC and protobuf can be built from source (see
+[gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp/quickstart/))
+and passed to CMake through `CMAKE_PREFIX_PATH`:
 
 ```
 INSTALL_ROOT=$PWD  # or something else
-
+export PROTO_DIR=$INSTALL_ROOT/proto-build
+export PATH="$PROTO_DIR/bin:$PATH"
 # this flag might be needed on some platforms
 export LDFLAGS="-lrt"
 
-
-export PROTO_DIR=$INSTALL_ROOT/proto-build
-export PATH="$PROTO_DIR/bin:$PATH"
-
 mkdir -p $PROTO_DIR
-git clone --recurse-submodules -b v1.46.3 --depth 1 --shallow-submodules https://github.com/grpc/grpc
+git clone --recurse-submodules -b v1.83.0 --depth 1 --shallow-submodules https://github.com/grpc/grpc
 mkdir -p grpc/cmake/build
 pushd grpc/cmake/build
 cmake -DgRPC_INSTALL=ON \
@@ -113,26 +120,10 @@ cmake -DgRPC_INSTALL=ON \
 make -j
 make install
 popd
-```
 
-To build the project itself then run:
-
-```
-git clone --recurse-submodules https://github.com/epi2me-labs/kraken2-server.git
-cd kraken2-server
-mkdir build
-pushd build
-# PROTO_DIR as above
-cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} --config Release ..
+mkdir -p build && cd build
+cmake -DCMAKE_PREFIX_PATH=${PROTO_DIR} -DCMAKE_BUILD_TYPE=Release ..
 make -j 8
-popd
-```
-
-The server and client executables will be written to:
-
-```
-build/server/kraken2_server
-build/client/kraken2_client
 ```
 
 ## Testing

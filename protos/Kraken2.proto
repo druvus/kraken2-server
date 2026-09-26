@@ -39,11 +39,15 @@ message Kraken2SequenceRequest {
     FORMAT_FASTQ = 2;
   }
   SequenceFormat format = 1;
-  string header = 2;
+  // Full header line. Not used by the server and no longer sent.
+  string header = 2 [deprecated = true];
+  // Read name up to the first whitespace.
   string id = 3;
   string seq = 4;
+  // Quality string, FASTQ only. Must match seq in length.
   string quals = 5;
-  string str_representation = 6;
+  // Text rendering of the record. Not used by the server and no longer sent.
+  string str_representation = 6 [deprecated = true];
   // Second read of a pair. Absent for single-end reads. When present the
   // server classifies both reads as one fragment.
   Kraken2SequenceRequest mate = 7;
@@ -57,9 +61,13 @@ message Kraken2SequenceRequestMulti {
 message Kraken2SequenceResult {
   string id = 1;
   bool classified = 2;
+  // External (NCBI) taxonomy id of the call, 0 when unclassified.
   uint64 tax_id = 3;
-  string name = 4;
+  // Scientific name of the call. Not sent since v0.2.0; the report carries names.
+  string name = 4 [deprecated = true];
+  // Sequence length (of the first mate for pairs).
   uint32 size = 5;
+  // Minimizer hit list in kraken2 format, e.g. "562:13 0:4 |:| 562:9".
   string hitlist = 6;
   // True when the result covers a read pair; size2 is then the mate length.
   bool paired = 7;
