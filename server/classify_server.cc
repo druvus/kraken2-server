@@ -8,6 +8,12 @@
 #include "classify_server.h"
 #include "messages.h"
 
+using kraken2server::AddHitlistString;
+using kraken2server::ResolveTree;
+using kraken2server::TrimPairInfo;
+using kraken2server::ReportStats;
+using kraken2server::ReportTotalStats;
+
 using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
 
 // Minimizer token stream, adapted from kraken2 classify.cc. Minimizers are
@@ -16,7 +22,6 @@ using namespace std::chrono_literals; // ns, us, ms, s, h, etc.
 enum MinTokKind { TOK_LOOKUP, TOK_SKIP, TOK_REPEAT, TOK_AMBIG,
                   TOK_BORDER_MATE, TOK_BORDER_FRAME };
 struct MinToken { uint8_t kind; uint32_t key_idx; };
-
 
 Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
         : opts(options) {
@@ -28,7 +33,6 @@ Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
     loader = std::thread([this]() { LoadIndex(); });
 }
 
-
 Kraken2ServerClassifier::~Kraken2ServerClassifier(){
     // The loader touches members, so it must finish before they are
     // destroyed. Loading cannot be interrupted, so a shutdown during load
@@ -38,12 +42,10 @@ Kraken2ServerClassifier::~Kraken2ServerClassifier(){
     }
 }
 
-
 std::string Kraken2ServerClassifier::GetSummary() {
     std::lock_guard<std::mutex> lock(stats_mtx);
     return summary;
 }
-
 
 void Kraken2ServerClassifier::LoadIndex() {
     index_available = false;
@@ -188,7 +190,6 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     std::cerr << "Finished stream handler." << std::endl;
 }
 
-
 void Kraken2ServerClassifier::ProcessBatch(
     const Kraken2SequenceRequestMulti &reqs,
     ThreadSafeQueue<BatchResults> &result_q) {
@@ -236,7 +237,6 @@ void Kraken2ServerClassifier::ProcessBatch(
     result_q.push(std::move(results));
 }
 
-
 Kraken2SequenceResult Kraken2ServerClassifier::UnclassifiedResult(
     const Sequence &dna, const Sequence *dna2)
 {
@@ -254,66 +254,11 @@ Kraken2SequenceResult Kraken2ServerClassifier::UnclassifiedResult(
     return result;
 }
 
-
 ////////////////////////////////
 // The following methods are adapted from the Kraken2 source code
 // (classify.cc). Quick mode and text output have been removed; paired
 // reads are handled per fragment rather than through a global option.
 ////////////////////////////////
-
-void Kraken2ServerClassifier::AddHitlistString(
-    ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy)
-{
-    auto last_code = taxa[0];
-    auto code_count = 1;
-
-    for (size_t i = 1; i < taxa.size(); i++)
-    {
-        auto code = taxa[i];
-
-        if (code == last_code)
-        {
-            code_count += 1;
-        }
-        else
-        {
-            if (last_code != MATE_PAIR_BORDER_TAXON && last_code != READING_FRAME_BORDER_TAXON)
-            {
-                if (last_code == AMBIGUOUS_SPAN_TAXON)
-                {
-                    oss << "A:" << code_count << " ";
-                }
-                else
-                {
-                    auto ext_code = taxonomy.nodes()[last_code].external_id;
-                    oss << ext_code << ":" << code_count << " ";
-                }
-            }
-            else
-            { // mate pair/reading frame marker
-                oss << (last_code == MATE_PAIR_BORDER_TAXON ? "|:| " : "-:- ");
-            }
-            code_count = 1;
-            last_code = code;
-        }
-    }
-    if (last_code != MATE_PAIR_BORDER_TAXON && last_code != READING_FRAME_BORDER_TAXON)
-    {
-        if (last_code == AMBIGUOUS_SPAN_TAXON)
-        {
-            oss << "A:" << code_count << " ";
-        }
-        else
-        {
-            auto ext_code = taxonomy.nodes()[last_code].external_id;
-            oss << ext_code << ":" << code_count;
-        }
-    }
-    else
-    { // mate pair/reading frame marker
-        oss << (last_code == MATE_PAIR_BORDER_TAXON ? "|:|" : "-:-");
-    }
-}
 
 Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
     Sequence &dna, Sequence *dna2,
@@ -452,7 +397,7 @@ Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
         total_kmers--;
     if (opts.use_translated_search) // account for reading frame markers
         total_kmers -= paired ? 4 : 2;
-    call = ResolveTree(hit_counts, taxonomy, total_kmers, opts);
+    call = ResolveTree(hit_counts, taxonomy, total_kmers, opts.confidence_threshold);
     // Void a call made by too few minimizer groups
     if (call && minimizer_hit_groups < opts.minimum_hit_groups)
         call = 0;
@@ -511,103 +456,6 @@ bool Kraken2ServerClassifier::MaskLowQualityBases(Sequence &dna, int minimum_qua
     return true;
 }
 
-
-taxid_t Kraken2ServerClassifier::ResolveTree(taxon_counts_t &hit_counts,
-                                             Taxonomy &taxonomy, size_t total_minimizers, Options &opts)
-{
-    taxid_t max_taxon = 0;
-    uint32_t max_score = 0;
-    uint32_t required_score = ceil(opts.confidence_threshold * total_minimizers);
-
-    // Sum each taxon's LTR path, find taxon with highest LTR score
-    for (auto &kv_pair : hit_counts)
-    {
-        taxid_t taxon = kv_pair.first;
-        uint32_t score = 0;
-
-        for (auto &kv_pair2 : hit_counts)
-        {
-            taxid_t taxon2 = kv_pair2.first;
-
-            if (taxonomy.IsAAncestorOfB(taxon2, taxon))
-            {
-                score += kv_pair2.second;
-            }
-        }
-
-        if (score > max_score)
-        {
-            max_score = score;
-            max_taxon = taxon;
-        }
-        else if (score == max_score)
-        {
-            max_taxon = taxonomy.LowestCommonAncestor(max_taxon, taxon);
-        }
-    }
-
-    // Reset max. score to be only hits at the called taxon
-    max_score = hit_counts[max_taxon];
-    // We probably have a call w/o required support (unless LCA resolved tie)
-    while (max_taxon && max_score < required_score)
-    {
-        max_score = 0;
-        for (auto &kv_pair : hit_counts)
-        {
-            taxid_t taxon = kv_pair.first;
-            // Add to score if taxon in max_taxon's clade
-            if (taxonomy.IsAAncestorOfB(max_taxon, taxon))
-            {
-                max_score += kv_pair.second;
-            }
-        }
-        // Score is now sum of hits at max_taxon and w/in max_taxon clade
-        if (max_score >= required_score)
-            // Kill loop and return, we've got enough support here
-            return max_taxon;
-        else
-            // Run up tree until confidence threshold is met
-            // Run off tree if required score isn't met
-            max_taxon = taxonomy.nodes()[max_taxon].parent_id;
-    }
-
-    return max_taxon;
-}
-
-std::string Kraken2ServerClassifier::ReportStats(struct timeval time1, struct timeval time2,
-                                                 ClassificationStats &stats)
-{
-    time2.tv_usec -= time1.tv_usec;
-    time2.tv_sec -= time1.tv_sec;
-    if (time2.tv_usec < 0)
-    {
-        time2.tv_sec--;
-        time2.tv_usec += 1000000;
-    }
-    double seconds = time2.tv_usec;
-    seconds /= 1e6;
-    seconds += time2.tv_sec;
-
-    uint64_t total_unclassified = stats.total_sequences - stats.total_classified;
-    // Guard against empty streams and zero elapsed time.
-    double denom_seqs = stats.total_sequences > 0 ? stats.total_sequences : 1.0;
-    double minutes = seconds > 0 ? seconds / 60 : 1.0 / 60;
-
-    return std::to_string(stats.total_sequences) + " sequences (" + DoubleStatToString(stats.total_bases / 1.0e6, 2) + " Mbp) processed in " + DoubleStatToString(seconds, 2) + "s (" + DoubleStatToString(stats.total_sequences / 1.0e3 / minutes, 2) + " Kseq/m, " + DoubleStatToString(stats.total_bases / 1.0e6 / minutes, 2) + " Mbp/m).\n" +
-           "\t" + std::to_string(stats.total_classified) + " sequences classified (" + DoubleStatToString(stats.total_classified * 100.0 / denom_seqs, 2) + "%)\n" +
-           "\t" + std::to_string(total_unclassified) + " sequences unclassified (" + DoubleStatToString(total_unclassified * 100.0 / denom_seqs, 2) + "%)\n";
-}
-
-std::string Kraken2ServerClassifier::ReportTotalStats(ClassificationStats &stats)
-{
-    uint64_t total_unclassified = stats.total_sequences - stats.total_classified;
-    double denom_seqs = stats.total_sequences > 0 ? stats.total_sequences : 1.0;
-
-    return std::to_string(stats.total_sequences) + " sequences (" + DoubleStatToString(stats.total_bases / 1.0e6, 2) + " Mbp) processed.\n" +
-           std::to_string(stats.total_classified) + " sequences classified (" + DoubleStatToString(stats.total_classified * 100.0 / denom_seqs, 2) + "%).\n" +
-           std::to_string(total_unclassified) + " sequences unclassified (" + DoubleStatToString(total_unclassified * 100.0 / denom_seqs, 2) + "%).\n";
-}
-
 void Kraken2ServerClassifier::GenerateReport(
         std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy,
         timeval &tv1, timeval &tv2, ClassificationStats &stats,
@@ -652,21 +500,4 @@ void Kraken2ServerClassifier::GenerateReport(
            << ReportTotalStats(total_stats);
         summary.assign(ss.str());
     }
-}
-
-std::string Kraken2ServerClassifier::TrimPairInfo(std::string &id)
-{
-    size_t sz = id.size();
-    if (sz <= 2)
-        return id;
-    if (id[sz - 2] == '/' && (id[sz - 1] == '1' || id[sz - 1] == '2'))
-        return id.substr(0, sz - 2);
-    return id;
-}
-
-std::string Kraken2ServerClassifier::DoubleStatToString(double d, const int precision)
-{
-    std::stringstream stream;
-    stream << std::fixed << std::setprecision(precision) << d;
-    return stream.str();
 }

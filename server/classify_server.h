@@ -16,6 +16,7 @@
 #include "utilities.h"
 
 // kraken2 server
+#include "classify_core.h"
 #include "thread_pool.hpp"
 #include "report_server.h"
 #include "thread_safe_queue.h"
@@ -36,9 +37,10 @@ using kraken2proto::Kraken2SequenceStreamResult;
 
 typedef ServerReaderWriter<Kraken2SequenceStreamResult, Kraken2SequenceRequestMulti> ServerStream;
 
-static const taxid_t AMBIGUOUS_SPAN_TAXON = TAXID_MAX - 2;
-static const taxid_t MATE_PAIR_BORDER_TAXON = TAXID_MAX;
-static const taxid_t READING_FRAME_BORDER_TAXON = TAXID_MAX - 1;
+using kraken2server::AMBIGUOUS_SPAN_TAXON;
+using kraken2server::MATE_PAIR_BORDER_TAXON;
+using kraken2server::READING_FRAME_BORDER_TAXON;
+using kraken2server::ClassificationStats;
 
 
 struct Options {
@@ -64,11 +66,6 @@ struct Options {
 };
 
 
-struct ClassificationStats {
-    uint64_t total_sequences;
-    uint64_t total_bases;
-    uint64_t total_classified;
-};
 
 
 struct BatchResults {
@@ -130,8 +127,6 @@ private:
     BS::thread_pool pool;
     std::thread loader;
 
-    void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy);
-
     /**
      * @brief Classify one fragment. dna2 is the mate for paired reads and
      *        nullptr for single-end reads.
@@ -155,18 +150,9 @@ private:
      */
     Kraken2SequenceResult UnclassifiedResult(const Sequence &dna, const Sequence *dna2);
 
-    std::string ReportStats(struct timeval time1, struct timeval time2, ClassificationStats &stats);
-
-    std::string ReportTotalStats(ClassificationStats &stats);
-
     void GenerateReport(
         std::string &results, std::string &summary, Options &opts, Taxonomy &taxonomy,
         timeval &tv1, timeval &tv2, ClassificationStats &stats, ClassificationStats &total_stats,
         taxon_counters_t &taxon_counters, taxon_counters_t &total_taxon_counters, std::mutex &stats_mtx);
 
-    taxid_t ResolveTree(taxon_counts_t &hit_counts, Taxonomy &taxonomy, size_t total_minimizers, Options &opts);
-
-    std::string TrimPairInfo(std::string &id);
-
-    std::string DoubleStatToString(double d, const int precision);
 };

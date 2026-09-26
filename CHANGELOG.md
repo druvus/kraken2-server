@@ -29,7 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fast client cannot make the server hold its whole input in memory.
 - The conda recipe and CI use the conda-forge `libgrpc` and `libprotobuf`
   packages instead of building gRPC from source.
-- CI compiles and smoke tests the server and client on every push.
+- CI compiles and smoke tests the server and client on every push and runs
+  the unit tests.
+- Unit tests (doctest, `-DBUILD_TESTS=ON`) for the pure classification
+  helpers, report writer, request conversion and queue. The helpers moved
+  from the classifier class into `server/classify_core.cc`.
+- The report writer uses the upstream kraken2 functions instead of a local
+  copy.
 - Usage errors on the command line exit with status 64 (`EX_USAGE`) instead
   of 0.
 ### Removed

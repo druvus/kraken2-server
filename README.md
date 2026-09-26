@@ -128,6 +128,13 @@ make -j 8
 
 ## Testing
 
+Unit tests use [doctest](https://github.com/doctest/doctest) (conda-forge
+package `doctest`). Configure with `-DBUILD_TESTS=ON` and run
+`build/tests/unit_tests` or `ctest`. They cover the pure classification
+helpers (taxon resolution, hit list formatting, pair name trimming), the
+report writer, the request conversion and the blocking queue, using a small
+synthetic taxonomy and no database.
+
 `testing/parity_test.sh` compares the server and client output with the
 `kraken2` command line program (the same version as the submodule) on a small
 database, for single-end, paired-end, mismatched and empty input. It needs

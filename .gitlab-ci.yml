@@ -27,11 +27,12 @@ build-test:
         - wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
         - bash miniforge.sh -b -p /tmp/miniforge
         - source /tmp/miniforge/bin/activate
-        - mamba create -y -q -n build -c conda-forge cmake libgrpc libprotobuf zlib cxx-compiler make
+        - mamba create -y -q -n build -c conda-forge cmake libgrpc libprotobuf zlib cxx-compiler make doctest
         - conda activate build
         - mkdir build && cd build
-        - cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST_TOOLS=ON ..
+        - cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST_TOOLS=ON -DBUILD_TESTS=ON ..
         - make -j 4
+        - ./tests/unit_tests
         - ./server/kraken2_server --help
         - ./client/kraken2_client --help
     artifacts:
