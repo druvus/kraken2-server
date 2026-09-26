@@ -1,8 +1,0 @@
-
-# Python client: generated stubs and packaging artefacts
-python/kraken2_client/Kraken2_pb2.py
-python/kraken2_client/Kraken2_pb2_grpc.py
-python/*.egg-info/
-python/build/
-__pycache__/
-.pytest_cache/
