@@ -19,7 +19,10 @@ function(project_warnings target)
     endif()
 endfunction()
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+# Keep -DNDEBUG: the abseil headers pulled in by gRPC only reference
+# out-of-line debug symbols (absl::Mutex::Dtor) without it, and the
+# conda-forge abseil libraries are release builds that do not export them.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # Locate and verify version of protobuf
 set(protobuf_MODULE_COMPATIBLE TRUE)
