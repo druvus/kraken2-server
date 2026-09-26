@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: kraken2-client
+Version: 0.2.0
+Summary: Python client for kraken2_server, a gRPC server around the Kraken 2 classifier
+License: Oxford Nanopore Technologies PLC. Public License Version 1.0
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: grpcio>=1.60
+Requires-Dist: protobuf>=4.21
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"

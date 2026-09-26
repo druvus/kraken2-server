@@ -1,0 +1,2 @@
+[console_scripts]
+k2client = kraken2_client.cli:main

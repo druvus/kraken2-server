@@ -1,0 +1,81 @@
+name: Build and test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up conda environment
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-name: build
+          create-args: >-
+            cmake
+            make
+            cxx-compiler
+            libgrpc
+            libprotobuf
+            zlib
+            doctest
+            llvm-openmp
+            kraken2
+            seqkit
+            openssl
+            python=3.12
+            grpcio
+            grpcio-tools
+            protobuf
+            pytest
+            pip
+          init-shell: bash
+          cache-environment: true
+          condarc: |
+            channels:
+              - conda-forge
+              - bioconda
+
+      - name: Configure
+        run: |
+          mkdir build && cd build
+          cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTS=ON -DBUILD_TEST_TOOLS=ON -DENABLE_WERROR=ON ..
+
+      - name: Build
+        run: make -C build -j 4
+
+      - name: Unit tests
+        run: ./build/tests/unit_tests
+
+      - name: Cache test database
+        uses: actions/cache@v4
+        with:
+          path: |
+            testing/virus-zymo-kraken2
+            testing/virus-zymo-kraken.reads.fastq.gz
+          key: virus-zymo-test-data-v1
+
+      - name: Parity test against kraken2
+        run: ./testing/parity_test.sh 8123
+
+      - name: Python client
+        run: |
+          # no build isolation so the stubs are generated with the
+          # environment's grpcio-tools, matching its grpcio
+          pip install --no-build-isolation ./python
+          pytest -q python/tests

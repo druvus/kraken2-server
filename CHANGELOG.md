@@ -10,6 +10,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   require client certificates. The client takes `--tls`, `--tls-ca`,
   `--tls-cert`, `--tls-key` and `--tls-server-name`. Without these the
   server prints a warning and runs unencrypted as before.
+- A Python client package (`python/`, `pip install --no-build-isolation
+  ./python`) with a `k2client` command taking the same options as the C++
+  client, and a library API that streams any iterable of records and yields
+  results in input order. Its tests compare its output with the C++ client.
+- A GitHub Actions workflow building and testing on Linux and macOS.
 - `--allow-remote-shutdown` on the server. The `RemoteShutdown` RPC is
   refused with `PERMISSION_DENIED` unless it is given.
 - Paired-end classification. The client accepts a mate file with `--sequence2`

@@ -59,6 +59,25 @@ The report file adds a header line before the standard kraken2 report
 columns.
 
 
+## Python client
+
+`python/` holds a Python package with the same protocol and output as the
+C++ client, for use from scripts, notebooks and pipelines:
+
+```
+pip install --no-build-isolation ./python
+k2client --port 8080 --sequence reads.fq.gz
+```
+
+```python
+from kraken2_client import Client, read_fastx
+with Client("localhost", 8080) as client:
+    for hit in client.classify(read_fastx("reads.fq.gz")):
+        print(hit.read_id, hit.tax_id)
+```
+
+See `python/README.md` for details.
+
 ## Security
 
 By default the server listens without TLS and refuses remote shutdown
