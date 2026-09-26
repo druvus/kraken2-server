@@ -141,6 +141,9 @@ build/client/kraken2_client
 `kraken2` command line program (the same version as the submodule) on a small
 database, for single-end, paired-end, mismatched and empty input. It needs
 `kraken2` and `seqkit` on the `PATH` and built binaries in `build/`.
+Configuring with `-DBUILD_TEST_TOOLS=ON` also builds `testing/raw_client`,
+which sends hand-built records and lets the script check how the server
+handles FASTQ records with a truncated quality string.
 
 ## Benchmarks
 

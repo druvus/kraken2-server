@@ -73,3 +73,8 @@ add_subdirectory(protos)
 add_subdirectory(utils)
 add_subdirectory(server)
 add_subdirectory(client)
+
+option(BUILD_TEST_TOOLS "Build test tools in testing/" OFF)
+if(BUILD_TEST_TOOLS)
+    add_subdirectory(testing)
+endif()

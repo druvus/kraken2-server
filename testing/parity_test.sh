@@ -105,6 +105,36 @@ wait $SERVER_PID
 check "server exit code" 0 $?
 trap - EXIT
 
+# Server-side handling of records whose quality string length differs from
+# the sequence length. kseq rejects such records in the regular client, so
+# they are sent with the raw test client (built with -DBUILD_TEST_TOOLS=ON).
+RAW_CLIENT=${RAW_CLIENT:-../build/testing/raw_client}
+if [ -x "$RAW_CLIENT" ]; then
+    echo "+++ Malformed quality strings with --min-quality +++"
+    gzip -dc $READS | awk '/^@af6a6aee/{getline s; getline; getline q;
+        printf "good\t%s\t%s\n", s, q;
+        printf "badqual\t%s\t%s\n", s, substr(q, 1, length(q) - 10);
+        printf "pair_badmate\t%s\t%s\t%s\t%s\n", s, q, s, substr(q, 1, 5);
+        printf "after\t%s\t%s\n", s, q; exit }' > $WORK/records.tsv
+    "$SERVER" --db $DB --host-ip 127.0.0.1 --port $PORT --min-quality 10 > $WORK/server_mq.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 3
+    "$RAW_CLIENT" 127.0.0.1:$PORT < $WORK/records.tsv > $WORK/raw.out 2> $WORK/raw.err
+    check "raw client exit code" 0 $?
+    check "well-formed read classified" C "$(awk '$2=="good"{print $1}' $WORK/raw.out)"
+    check "truncated quality read unclassified" "U 0:0" "$(awk '$2=="badqual"{print $1, $5}' $WORK/raw.out)"
+    check "pair with truncated mate unclassified" "U 0:0" "$(awk '$2=="pair_badmate"{print $1, $5}' $WORK/raw.out)"
+    check "read after malformed records classified" C "$(awk '$2=="after"{print $1}' $WORK/raw.out)"
+    check "malformed records logged" 2 "$(grep -c 'reporting as unclassified' $WORK/server_mq.log)"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    check "server survived malformed records" 0 $?
+    trap - EXIT
+else
+    echo "SKIP  malformed quality test (raw_client not built; use -DBUILD_TEST_TOOLS=ON)"
+fi
+
 if [ $FAILED -eq 0 ]; then
     echo "All checks passed."
     rm -rf $WORK

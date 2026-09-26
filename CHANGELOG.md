@@ -32,7 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - A FASTQ record whose quality string length differs from its sequence, with
   `--min-quality` set, is reported as unclassified instead of terminating the
-  server. The client now reports truncated or unreadable records and exits
+  server. Covered by `testing/parity_test.sh` using the `raw_client` test tool. The client now reports truncated or unreadable records and exits
   with a non-zero status rather than treating them as end of input.
 - The classification summary was read without locking while another stream
   could be rewriting it.
