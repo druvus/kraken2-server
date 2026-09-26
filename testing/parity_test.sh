@@ -59,9 +59,14 @@ ndiff() {
 
 echo "+++ Reference kraken2 +++"
 kraken2 --db $DB --threads 4 --minimum-hit-groups 2 \
-    --report $WORK/ref_single.report --output $WORK/ref_single.out $READS > /dev/null 2>&1
+    --report $WORK/ref_single.report --output $WORK/ref_single.out $READS > $WORK/ref_single.log 2>&1
+check "reference kraken2 single-end run" 0 $?
 kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --paired \
-    --report $WORK/ref_paired.report --output $WORK/ref_paired.out $WORK/r1.fq.gz $WORK/r2.fq.gz > /dev/null 2>&1
+    --report $WORK/ref_paired.report --output $WORK/ref_paired.out $WORK/r1.fq.gz $WORK/r2.fq.gz > $WORK/ref_paired.log 2>&1
+check "reference kraken2 paired-end run" 0 $?
+for f in ref_single.out ref_single.report ref_paired.out ref_paired.report; do
+    [ -s $WORK/$f ] || { echo "FAIL  reference output $f missing"; FAILED=1; }
+done
 
 echo "+++ Starting server on port $PORT +++"
 "$SERVER" --db $DB --host-ip 127.0.0.1 --port $PORT > $WORK/server.log 2>&1 &

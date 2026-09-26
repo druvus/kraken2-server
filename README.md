@@ -83,7 +83,9 @@ make -j 8
 ```
 
 Note that the older `grpc-cpp` conda package pins a protobuf without CMake
-configuration files and does not work here.
+configuration files and does not work here. The conda recipe in `conda/`
+uses the same packages; `conda build conda/` produces the package that the
+conda channel distributes.
 
 Alternatively gRPC can be built from source as follows.
 

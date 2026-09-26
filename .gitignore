@@ -1,5 +1,6 @@
 3rdparty/
 build/
+build-conda/
 grpc/
 proto-build/
 

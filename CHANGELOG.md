@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   copied between the reader, the queue and the gRPC messages on both sides.
 - The server limits the number of request batches buffered per stream, so a
   fast client cannot make the server hold its whole input in memory.
+- The conda recipe and CI use the conda-forge `libgrpc` and `libprotobuf`
+  packages instead of building gRPC from source.
 ### Fixed
 - A FASTQ record whose quality string length differs from its sequence, with
   `--min-quality` set, is reported as unclassified instead of terminating the
