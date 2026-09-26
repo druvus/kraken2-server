@@ -79,6 +79,7 @@ echo "+++ Single-end +++"
     --report $WORK/single.report > $WORK/single.out 2> $WORK/single.err
 check "single-end client exit code" 0 $?
 check "single-end per-read output identical" 0 "$(ndiff $WORK/single.out $WORK/ref_single.out)"
+check "single-end output in input order" 0 "$(diff $WORK/single.out $WORK/ref_single.out | grep -c '^[<>]')"
 check "single-end report identical" 0 "$(diff <(tail -n +2 $WORK/single.report) $WORK/ref_single.report | grep -c '^[<>]')"
 
 echo "+++ Paired-end +++"
@@ -86,6 +87,7 @@ echo "+++ Paired-end +++"
     --report $WORK/paired.report > $WORK/paired.out 2> $WORK/paired.err
 check "paired-end client exit code" 0 $?
 check "paired-end per-read output identical" 0 "$(ndiff $WORK/paired.out $WORK/ref_paired.out)"
+check "paired-end output in input order" 0 "$(diff $WORK/paired.out $WORK/ref_paired.out | grep -c '^[<>]')"
 check "paired-end report identical" 0 "$(diff <(tail -n +2 $WORK/paired.report) $WORK/ref_paired.report | grep -c '^[<>]')"
 check "paired-end hit lists contain mate marker" 1500 "$(grep -c '|:|' $WORK/paired.out)"
 

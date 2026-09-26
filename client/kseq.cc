@@ -4,37 +4,46 @@
 #include <stdexcept>
 #include <string>
 
+#include <zlib.h>
+#include "kseq.h"
 #include "kseq.cc.h"
+
+KSEQ_INIT(gzFile, gzread)
+
+struct FastReader::Impl
+{
+    gzFile fp = nullptr;
+    kseq_t *seq = nullptr;
+
+    ~Impl()
+    {
+        if (seq != nullptr) kseq_destroy(seq);
+        if (fp != nullptr) gzclose(fp);
+    }
+};
 
 
 FastReader::FastReader(std::string filename)
-    : m_filename(filename), m_fp(nullptr), m_seq(nullptr)
+    : m_filename(filename), m_impl(new Impl)
 {
     FILE *instream = (filename == "-") ? stdin : fopen(filename.c_str(), "r");
     if (instream == nullptr) {
         throw std::runtime_error(
             "Cannot open " + filename + ": " + std::strerror(errno));
     }
-    m_fp = gzdopen(fileno(instream), "r");
-    if (m_fp == nullptr) {
+    m_impl->fp = gzdopen(fileno(instream), "r");
+    if (m_impl->fp == nullptr) {
         throw std::runtime_error("Cannot open " + filename + " for reading.");
     }
-    m_seq = kseq_init(m_fp);
+    m_impl->seq = kseq_init(m_impl->fp);
 }
 
 
-FastReader::~FastReader()
-{
-    if (m_seq != nullptr) {
-        kseq_destroy(m_seq);
-    }
-    if (m_fp != nullptr) {
-        gzclose(m_fp);
-    }
-}
+FastReader::~FastReader() = default;
 
 
 int FastReader::read(Kraken2SequenceRequest& rec) {
+    kseq_t *m_seq = m_impl->seq;
     int rtn;
     if ((rtn = kseq_read(m_seq)) < 0) {
         rec.Clear();

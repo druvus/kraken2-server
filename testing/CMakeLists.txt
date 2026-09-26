@@ -6,3 +6,5 @@ target_link_libraries(raw_client
     ${_PROTOBUF_LIBPROTOBUF}
     ${_REFLECTION}
     ${_GRPC_GRPCPP})
+
+project_warnings(raw_client)

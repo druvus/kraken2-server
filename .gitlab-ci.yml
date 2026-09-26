@@ -31,7 +31,7 @@ build-test:
         - mamba create -y -q -n build -c conda-forge cmake libgrpc libprotobuf zlib cxx-compiler make doctest
         - conda activate build
         - mkdir build && cd build
-        - cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST_TOOLS=ON -DBUILD_TESTS=ON ..
+        - cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST_TOOLS=ON -DBUILD_TESTS=ON -DENABLE_WERROR=ON ..
         - make -j 4
         - ./tests/unit_tests
         - ./server/kraken2_server --help

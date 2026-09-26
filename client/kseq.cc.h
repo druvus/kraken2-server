@@ -1,17 +1,16 @@
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "Kraken2.grpc.pb.h"
 
-#include <zlib.h>
-#include "kseq.h"
-
 using kraken2proto::Kraken2SequenceRequest;
 
-KSEQ_INIT(gzFile, gzread)
-
+// FASTA/FASTQ reader over kseq. The kseq types and functions live in
+// kseq.cc only, behind FastReader::Impl, so including this header does not
+// instantiate them.
 class FastReader
 {
 public:
@@ -39,8 +38,8 @@ public:
     // read all sequences
     int read_all(std::vector<Kraken2SequenceRequest> &seqs);
 private:
+    struct Impl;
     std::string m_filename;
-    gzFile m_fp;
-    kseq_t *m_seq;
+    std::unique_ptr<Impl> m_impl;
     int m_last_status = 0;
 };

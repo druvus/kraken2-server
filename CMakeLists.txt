@@ -9,6 +9,15 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_compile_options(-Wall)
 add_definitions(-DLINEAR_PROBING)
+
+# Treat warnings as errors in this project's own sources (not the kraken2
+# submodule). Enabled in CI.
+option(ENABLE_WERROR "Treat warnings as errors in project sources" OFF)
+function(project_warnings target)
+    if(ENABLE_WERROR)
+        target_compile_options(${target} PRIVATE -Werror)
+    endif()
+endfunction()
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 

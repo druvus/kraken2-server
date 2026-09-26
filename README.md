@@ -54,8 +54,9 @@ serve single-end and paired-end clients at the same time.
 
 The per-read output has the same columns as the standard `kraken2` output
 (classified flag, read id, taxonomy id, sequence length or `len1|len2` for
-pairs, and the minimizer hit list). The report file adds a header line
-before the standard kraken2 report columns.
+pairs, and the minimizer hit list), in the same order as the input reads.
+The report file adds a header line before the standard kraken2 report
+columns.
 
 
 ## Building from source

@@ -18,8 +18,6 @@
 #include "thread_safe_queue.h"
 #include "Kraken2.grpc.pb.h"
 
-#include <zlib.h>
-#include "kseq.h"
 #include "kseq.cc.h"
 
 using namespace std::chrono_literals; // ns, us, ms, s, h, etc.

@@ -17,7 +17,7 @@
 
 // kraken2 server
 #include "classify_core.h"
-#include "thread_pool.hpp"
+#include "worker_pool.h"
 #include "report_server.h"
 #include "thread_safe_queue.h"
 #include "Kraken2.grpc.pb.h"
@@ -69,6 +69,9 @@ struct Options {
 
 
 struct BatchResults {
+   // Position of the request batch in the stream, used to write results
+   // back in input order.
+   uint64_t sequence = 0;
    Kraken2SequenceResultMulti k2results;
    taxon_counters_t taxon_counters;
    ClassificationStats stats = {0, 0, 0};
@@ -106,7 +109,7 @@ public:
      *        pushes the results and per-batch counters onto result_q.
      */
     void ProcessBatch(
-        const Kraken2SequenceRequestMulti &reqs,
+        const Kraken2SequenceRequestMulti &reqs, uint64_t sequence,
         ThreadSafeQueue<BatchResults> &result_q);
 
     /**
@@ -124,7 +127,7 @@ private:
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
     std::mutex stats_mtx;
-    BS::thread_pool pool;
+    WorkerPool pool;
     std::thread loader;
 
     /**

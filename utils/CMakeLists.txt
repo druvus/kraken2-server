@@ -11,3 +11,4 @@ target_include_directories(server_client_utils PUBLIC ./include)
 target_link_libraries(server_client_utils
     classify
     kraken2_proto)
+project_warnings(server_client_utils)

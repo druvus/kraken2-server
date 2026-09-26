@@ -31,6 +31,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   packages instead of building gRPC from source.
 - CI compiles and smoke tests the server and client on every push, runs the
   unit tests, and runs the kraken2 parity test with a cached test database.
+- Results are returned in the order the reads were sent, as with `kraken2`,
+  whatever the number of classification threads.
+- The vendored BS::thread_pool header is replaced by a small worker pool
+  built on the project's own queue.
+- Warnings are errors for the project's own sources in CI (`-DENABLE_WERROR=ON`).
 - Server and client share a table-driven option parser; each option is
   declared once, usage text is generated, and error messages name the
   option and accepted range.

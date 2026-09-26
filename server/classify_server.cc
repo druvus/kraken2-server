@@ -1,4 +1,5 @@
 #include <condition_variable>
+#include <map>
 #include <fstream>
 #include <getopt.h>
 #include <memory>
@@ -24,12 +25,11 @@ enum MinTokKind { TOK_LOOKUP, TOK_SKIP, TOK_REPEAT, TOK_AMBIG,
 struct MinToken { uint8_t kind; uint32_t key_idx; };
 
 Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
-        : opts(options) {
-    // start a thread pool to handle classification tasks and
-    // start loading the index in the background.
-    pool.reset(opts.thread_pool);
+        : opts(options), pool(opts.thread_pool < 0 ? 0 : (size_t) opts.thread_pool) {
+    // The pool handles classification tasks; the index loads in the
+    // background.
     std::cout << "Created classification thread pool with "
-              << pool.get_thread_count() << " thread(s)." << std::endl;
+              << pool.thread_count() << " thread(s)." << std::endl;
     loader = std::thread([this]() { LoadIndex(); });
 }
 
@@ -95,27 +95,42 @@ void Kraken2ServerClassifier::LoadIndex() {
 }
 
 // Drain classified batches onto the gRPC stream until the queue is closed
-// and empty. Runs on its own thread so writes overlap with classification.
+// and empty. Batches finish in any order on the pool; they are held here
+// and written in input order, as kraken2 does, so the client sees results
+// in the same order as its reads. Runs on its own thread so writes overlap
+// with classification.
 static void ResultsHandler(
         ServerStream *stream,
         taxon_counters_t &stream_taxon_counters,
         ClassificationStats &stream_stats,
         ThreadSafeQueue<BatchResults> &results_queue) {
+    std::map<uint64_t, BatchResults> pending;
+    uint64_t next_sequence = 0;
     while (std::optional<BatchResults> res = results_queue.pop_wait()) {
-        // The client is configured to receive messages up to INT_MAX, and
-        // the client limits request batches to 128 MB, so a batch of
-        // results always fits.
-        Kraken2SequenceStreamResult result;
-        result.mutable_classifications()->Swap(&res->k2results);
-        stream->Write(result, WriteOptions().set_buffer_hint());
-        // update stats for the stream
-        stream_stats.total_bases += res->stats.total_bases;
-        stream_stats.total_classified += res->stats.total_classified;
-        stream_stats.total_sequences += res->stats.total_sequences;
-        // update taxon_counters for the stream
-        for (auto &kv_pair : res->taxon_counters) {
-            stream_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
+        pending.emplace(res->sequence, std::move(*res));
+        for (auto it = pending.find(next_sequence); it != pending.end();
+             it = pending.find(++next_sequence)) {
+            BatchResults &batch = it->second;
+            // The client is configured to receive messages up to INT_MAX, and
+            // the client limits request batches to 128 MB, so a batch of
+            // results always fits.
+            Kraken2SequenceStreamResult result;
+            result.mutable_classifications()->Swap(&batch.k2results);
+            stream->Write(result, WriteOptions().set_buffer_hint());
+            // update stats for the stream
+            stream_stats.total_bases += batch.stats.total_bases;
+            stream_stats.total_classified += batch.stats.total_classified;
+            stream_stats.total_sequences += batch.stats.total_sequences;
+            // update taxon_counters for the stream
+            for (auto &kv_pair : batch.taxon_counters) {
+                stream_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
+            }
+            pending.erase(it);
         }
+    }
+    if (!pending.empty()) {
+        std::cerr << "Warning: " << pending.size()
+                  << " result batch(es) never reached the writer." << std::endl;
     }
 }
 
@@ -141,12 +156,13 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     // Backpressure: limit the number of request batches held by this stream
     // (queued in the pool or being classified) so a fast client cannot
     // make the server buffer its whole input.
-    const size_t max_in_flight = std::max<size_t>(4, 2 * pool.get_thread_count());
+    const size_t max_in_flight = std::max<size_t>(4, 2 * pool.thread_count());
     std::mutex in_flight_mtx;
     std::condition_variable in_flight_cv;
     size_t in_flight = 0;
 
     // Classify while reads are still being received on the input stream
+    uint64_t sequence = 0;
     while (!context->IsCancelled()) {
         // Each batch is owned by a shared_ptr so the pool can copy the task
         // object without copying the message.
@@ -159,9 +175,10 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
             in_flight_cv.wait(lock, [&] { return in_flight < max_in_flight; });
             in_flight++;
         }
-        pool.push_task([this, req, &results_queue, &in_flight_mtx, &in_flight_cv, &in_flight]() {
+        const uint64_t this_sequence = sequence++;
+        pool.push([this, req, this_sequence, &results_queue, &in_flight_mtx, &in_flight_cv, &in_flight]() {
             try {
-                ProcessBatch(*req, results_queue);
+                ProcessBatch(*req, this_sequence, results_queue);
             }
             catch (const std::exception &ex) {
                 std::cerr << "Error classifying batch: " << ex.what() << std::endl;
@@ -191,7 +208,7 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
 }
 
 void Kraken2ServerClassifier::ProcessBatch(
-    const Kraken2SequenceRequestMulti &reqs,
+    const Kraken2SequenceRequestMulti &reqs, uint64_t sequence,
     ThreadSafeQueue<BatchResults> &result_q) {
 
     MinimizerScanner scanner(
@@ -203,6 +220,7 @@ void Kraken2ServerClassifier::ProcessBatch(
     vector<string> translated_frames(6);
 
     BatchResults results = BatchResults();
+    results.sequence = sequence;
     results.k2results.mutable_classes()->Reserve(reqs.seqs_size());
 
     kraken2::Sequence seq, seq2;

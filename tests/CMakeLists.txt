@@ -8,7 +8,8 @@ add_executable(unit_tests
     test_report.cc
     test_thread_safe_queue.cc
     test_messages.cc
-    test_cli.cc)
+    test_cli.cc
+    test_worker_pool.cc)
 
 target_link_libraries(unit_tests
     doctest::doctest
@@ -20,3 +21,5 @@ target_link_libraries(unit_tests
     ${_GRPC_GRPCPP})
 
 add_test(NAME unit_tests COMMAND unit_tests)
+
+project_warnings(unit_tests)
