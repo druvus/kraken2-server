@@ -63,6 +63,7 @@ add_library(classify
     kraken2/src/seqreader.cc
     kraken2/src/aa_translate.cc
     kraken2/src/utilities.cc
+    kraken2/src/reports.cc
     kraken2/src/hyperloglogplus.cc)
 
 # Specify the headers (include) for this lib (target) and declare them PUBLIC so are findable by other libs/executables
