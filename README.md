@@ -38,18 +38,54 @@ kraken2_client --port 8080 --sequence <reads.fq.gz>
 ```
 
 where `<reads.fq.gz>` can be FASTQ or FASTA either plain text or gzip compressed.
+Use `--sequence -` to read from standard input.
 
-The output gives some of the same details as running the standard
-`kraken2` program. Currently it is not identical; the intention is to
-in future provide compatible output.
+Paired-end reads are classified as one fragment per pair, as with
+`kraken2 --paired`, by giving the mate file as a second input:
+
+```
+kraken2_client --port 8080 --sequence <reads_1.fq.gz> --sequence2 <reads_2.fq.gz>
+```
+
+The two files must list mates in the same order. If they contain different
+numbers of reads, only complete pairs are classified and the client exits
+with a non-zero status. Pairing is decided per read, so a single server can
+serve single-end and paired-end clients at the same time.
+
+The per-read output has the same columns as the standard `kraken2` output
+(classified flag, read id, taxonomy id, sequence length or `len1|len2` for
+pairs, and the minimizer hit list). The report file adds a header line
+before the standard kraken2 report columns.
 
 
 ## Building from source
 
 The project can be built with `cmake` >3.13 and a C++17 compiler.
 
+The Kraken2 sources are included as a git submodule (`kraken2/`, pinned to
+upstream commit `01fb1d9`, Kraken 2.17.2) and are compiled into the server.
+Fetch the submodule before building:
+
+```
+git submodule update --init
+```
+
 The server-client architecture uses gRPC and protobuf to communicate. An
-installation of gRPC (with protobuf is required).
+installation of gRPC (with protobuf is required). On a workstation the
+conda-forge packages are sufficient, for example:
+
+```
+mamba create -n k2build -c conda-forge cmake libgrpc libprotobuf zlib llvm-openmp cxx-compiler make
+mamba activate k2build
+mkdir build && cd build
+cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release ..
+make -j 8
+```
+
+Note that the older `grpc-cpp` conda package pins a protobuf without CMake
+configuration files and does not work here.
+
+Alternatively gRPC can be built from source as follows.
 
 The following should be sufficient to setup an installation of gRPC
 and protobuf (see [gRPC Dependencies for C++](https://grpc.io/docs/languages/cpp/quickstart/)):
@@ -80,7 +116,7 @@ popd
 To build the project itself then run:
 
 ```
-git clone https://github.com/epi2me-labs/kraken2-server.git`
+git clone --recurse-submodules https://github.com/epi2me-labs/kraken2-server.git
 cd kraken2-server
 mkdir build
 pushd build
@@ -96,6 +132,13 @@ The server and client executables will be written to:
 build/server/kraken2_server
 build/client/kraken2_client
 ```
+
+## Testing
+
+`testing/parity_test.sh` compares the server and client output with the
+`kraken2` command line program (the same version as the submodule) on a small
+database, for single-end, paired-end, mismatched and empty input. It needs
+`kraken2` and `seqkit` on the `PATH` and built binaries in `build/`.
 
 ## Benchmarks
 

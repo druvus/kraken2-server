@@ -48,6 +48,7 @@ using kraken2proto::Kraken2ShutdownResult;
 struct Options
 {
     std::string sequence;
+    std::string sequence2;  // mate file for paired-end reads, empty for single-end
     std::string report_file;
     std::string host = "localhost";
     int port = 8080;
@@ -71,35 +72,38 @@ public:
     /**
      * @brief Send sequences from a kseq file as a stream and receive classifications individually as a stream.
      *
-     * @param sequence_name
+     * @param sequence_name  path to reads (R1 for paired data)
+     * @param sequence2_name path to mates (R2), empty for single-end data
      * @return EX_IOERR if sequences could not be read
+     * @return EX_DATAERR if the two paired-end inputs have different lengths
      * @return EX_UNAVAILABLE if sequences could nto be sent to server
      * @return else gRPC status code
      */
-    int ClassifySequences(const std::string &sequence_name, const std::string &report_file) {
+    int ClassifySequences(const std::string &sequence_name,
+                          const std::string &sequence2_name,
+                          const std::string &report_file) {
         std::cerr << "Classifying sequence stream." << std::endl;
         int state = WaitForServer();
         if (state != 0) {return state;}
 
         ClientContext context;
-        Kraken2SequenceResultMulti response;
         ClientStream stream(sequence_stub->ClassifyStream(&context));
         std::atomic<uint64_t> seqs_in_flight = 0;
 
-        // queue for gRPC messages (i.e. sequence reads)
-        ThreadSafeQueue<std::vector<Kraken2SequenceRequest>>
-            *batches_queue = new ThreadSafeQueue<std::vector<Kraken2SequenceRequest>>();
+        // Bounded queue of read batches between the file reader and the
+        // gRPC writer. The reader blocks when MAX_BATCHES are buffered and
+        // closes the queue when the input is exhausted.
+        ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> batches_queue(MAX_BATCHES);
 
         // reads data from file into queue
         std::future<int> fastq_batches = std::async(
             std::launch::async, &SequenceClient::FastBatcher, this,
-            std::ref(sequence_name), batches_queue);
+            std::ref(sequence_name), std::ref(sequence2_name), std::ref(batches_queue));
 
         // take data from queue and send over gRPC
         std::future<int> stream_batches = std::async(
             std::launch::async, &SequenceClient::StreamWriter, this,
-            std::ref(fastq_batches), std::ref(seqs_in_flight),
-            batches_queue, std::ref(stream));
+            std::ref(seqs_in_flight), std::ref(batches_queue), std::ref(stream));
 
         // reading back results on gRPC stream
         std::future<int> recv_reads = std::async(
@@ -112,7 +116,6 @@ public:
         recv_reads.wait();
         std::cerr << "Done waiting" << std::endl;
 
-        delete batches_queue;
         std::cerr << "Sent    : " << stream_batches.get() << std:: endl;
         std::cerr << "Received: " << recv_reads.get() << std::endl;
         assert(seqs_in_flight==0);
@@ -121,8 +124,14 @@ public:
         Status status = stream->Finish();
         if (!status.ok()) {
             std::cerr << "Client RPC stream failed: " << status.error_message() << std::endl;
+            return status.error_code();
         }
-    
+        if (fastq_batches.get() < 0) {
+            return EX_IOERR;
+        }
+        if (pairs_mismatched) {
+            return EX_DATAERR;
+        }
         return status.error_code();
     }
 
@@ -168,60 +177,54 @@ public:
     }
 
     int StreamWriter(
-            std::future<int> &total_batches,
             std::atomic<uint64_t> &seqs_in_flight,
-            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> *batches,
+            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches,
             ClientStream &writer) {
         int seqs_sent = 0;
         try {
-            while (!(
-                // we've finished if we've received the signal AND theres nothing left
-                total_batches.wait_for(0s) == std::future_status::ready
-                && batches->size() == 0
-            )) {
-                std::optional<std::vector<Kraken2SequenceRequest>> item = batches->pop();
-                if (item.has_value()) {
-                    std::vector<Kraken2SequenceRequest> batch = item.value();
-                    bool show_msg = true;
-                    while (true) {
-                        if ((seqs_in_flight + batch.size() >= MAX_IN_FLIGHT)) {
-                            std::this_thread::sleep_for(10ms);
-                            if (show_msg) {
-                                show_msg = false;
-                                std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
-                            }
-                            continue;
-                        }
-                        else { break; }
+            // pop_wait returns an empty optional once the reader has closed
+            // the queue and every batch has been taken.
+            while (std::optional<std::vector<Kraken2SequenceRequest>> item = batches.pop_wait()) {
+                std::vector<Kraken2SequenceRequest> batch = std::move(*item);
+                bool show_msg = true;
+                while (seqs_in_flight + batch.size() >= MAX_IN_FLIGHT) {
+                    if (show_msg) {
+                        show_msg = false;
+                        std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
                     }
-                    
-                    // rebatch to smaller batches for stream
-                    const uint64_t MAX_SIZE = 128 * 1024 * 1024;
-                    for(size_t i = 0; i < batch.size(); i += ST_BATCH_SIZE) {
-                        auto last = std::min(batch.size(), i + ST_BATCH_SIZE);
-                        size_t bsize = last - i;
-                        Kraken2SequenceRequestMulti req;
-                        req.mutable_seqs()->Assign(batch.begin() + i, batch.begin() + last);
-                        uint64_t msg_size = req.ByteSizeLong();
-                        if (msg_size > MAX_SIZE) {
-                            // send one by one
-                            for (size_t k = i; k<last; ++k) {
-                                Kraken2SequenceRequestMulti req;
-                                req.mutable_seqs()->Assign(batch.begin() + k, batch.begin() + k + 1);
-                                if (req.ByteSizeLong() > MAX_SIZE) {
-                                    std::cerr << "Read is too large! Skipping." << std::endl;
-                                    continue;
-                                }
-                                writer->Write(req, WriteOptions().set_buffer_hint());
-                                seqs_in_flight.fetch_add(1);
-                                seqs_sent++;
+                    std::this_thread::sleep_for(10ms);
+                }
+
+                // rebatch to smaller batches for stream, moving each read
+                // into the message rather than copying it
+                const uint64_t MAX_SIZE = 128 * 1024 * 1024;
+                for(size_t i = 0; i < batch.size(); i += ST_BATCH_SIZE) {
+                    auto last = std::min(batch.size(), i + ST_BATCH_SIZE);
+                    size_t bsize = last - i;
+                    Kraken2SequenceRequestMulti req;
+                    req.mutable_seqs()->Reserve(bsize);
+                    for (size_t k = i; k < last; ++k) {
+                        req.mutable_seqs()->Add(std::move(batch[k]));
+                    }
+                    uint64_t msg_size = req.ByteSizeLong();
+                    if (msg_size > MAX_SIZE) {
+                        // send one by one
+                        for (auto &read : *req.mutable_seqs()) {
+                            Kraken2SequenceRequestMulti single;
+                            single.mutable_seqs()->Add(std::move(read));
+                            if (single.ByteSizeLong() > MAX_SIZE) {
+                                std::cerr << "Read is too large! Skipping." << std::endl;
+                                continue;
                             }
+                            writer->Write(single, WriteOptions().set_buffer_hint());
+                            seqs_in_flight.fetch_add(1);
+                            seqs_sent++;
                         }
-                        else {
-                            writer->Write(req);
-                            seqs_in_flight.fetch_add(bsize);
-                            seqs_sent += bsize;
-                        }
+                    }
+                    else {
+                        writer->Write(req);
+                        seqs_in_flight.fetch_add(bsize);
+                        seqs_sent += bsize;
                     }
                 }
             }
@@ -267,33 +270,66 @@ public:
         return n_reads;
     }
     
+    /**
+     * @brief Read batches of reads (or read pairs when sequence2_file is
+     *        non-empty) from disk onto the batches queue.
+     *
+     * @return number of batches read, or -1 if the input could not be read.
+     */
     int FastBatcher(
             const std::string &sequence_file,
-            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> *batches_queue) {
+            const std::string &sequence2_file,
+            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches_queue) {
         int n_batches = 0;
+        const bool paired = !sequence2_file.empty();
+        // Whatever happens, the writer must be released.
+        struct Closer {
+            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &q;
+            ~Closer() { q.close(); }
+        } closer{batches_queue};
         try {
-            FastReader reader = FastReader(sequence_file);
-        
-            std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
+            FastReader reader(sequence_file);
+            std::unique_ptr<FastReader> mate_reader;
+            if (paired) {
+                mate_reader.reset(new FastReader(sequence2_file));
+                std::cerr << "Reading read pairs from files: " << sequence_file
+                          << " and " << sequence2_file << std::endl;
+            }
+            else {
+                std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
+            }
+            bool mismatched = false;
             while (true) {
-                if ((batches_queue->size() >= MAX_BATCHES)) {
-                    std::cerr << "Waiting before reading new read batch." << std::endl;
-                    std::this_thread::sleep_for(10ms);
-                    continue;
-                }
- 
                 std::vector<Kraken2SequenceRequest> seqs;
                 int n_reads;
-                if ((n_reads = reader.read(seqs, FASTQ_BATCH_SIZE)) > 0) {
-                    n_batches++;
-                    batches_queue->push(std::move(seqs));
+                if (paired) {
+                    n_reads = reader.read_pairs(seqs, FASTQ_BATCH_SIZE, *mate_reader, mismatched);
                 }
-                else { break; }
+                else {
+                    n_reads = reader.read(seqs, FASTQ_BATCH_SIZE);
+                }
+                if (n_reads > 0) {
+                    n_batches++;
+                    // blocks while MAX_BATCHES are already buffered
+                    batches_queue.push(std::move(seqs));
+                }
+                if (n_reads < FASTQ_BATCH_SIZE) { break; }
+            }
+            if (mismatched) {
+                std::cerr << "Warning: paired-end inputs have different numbers of reads; "
+                          << "only complete pairs were classified: "
+                          << sequence_file << ", " << sequence2_file << std::endl;
+                pairs_mismatched = true;
+            }
+            if (reader.failed() || (paired && mate_reader->failed())) {
+                // The reader has already described the problem.
+                return -1;
             }
         }
         catch (const std::exception &ex) {
             std::cerr << "Failed to read sequences from file: " << sequence_file
                       << ": " << ex.what() << std::endl;
+            return -1;
         }
         return n_batches;
     }
@@ -303,6 +339,9 @@ private:
 
     // The gRPC service stub for the service defined in Kraken2.proto
     std::unique_ptr<kraken2proto::Kraken2Service::Stub> sequence_stub;
+
+    // Set by FastBatcher when R1 and R2 have different read counts.
+    std::atomic<bool> pairs_mismatched{false};
 
     int WaitForServer() {
         // wait for server
@@ -361,14 +400,20 @@ private:
      *
      * @param classification
      */
-    void PrintClassification(Kraken2SequenceResult classification) {
+    void PrintClassification(const Kraken2SequenceResult &classification) {
         std::string classified = classification.classified() ? "C" : "U";
         std::cout
             << classified << '\t'
             << classification.id() << '\t'
             << classification.tax_id() << '\t'
-            << classification.size() << '\t'
-            << classification.hitlist() << std::endl;
+            << classification.size();
+        // kraken2 reports paired fragments as len1|len2
+        if (classification.paired()) {
+            std::cout << '|' << classification.size2();
+        }
+        std::cout
+            << '\t'
+            << classification.hitlist() << '\n';
     }
 };
 
@@ -376,7 +421,8 @@ void Usage(int exit_code) {
     std::cerr << "Usage: kraken2-client [options]" << std::endl
               << std::endl
               << "\t-h, -H, -?, --help           Usage" << std::endl
-              << "\t-s, -S, --sequence [path]    Path to sequence file (*.fast(a|q)(.gz)" << std::endl
+              << "\t-s, -S, --sequence [path]    Path to sequence file (*.fast(a|q)(.gz), or - for stdin" << std::endl
+              << "\t-2,     --sequence2 [path]   Path to mate file for paired-end reads (same order as --sequence)" << std::endl
               << "\t-r, -R  --report   [path]    Path to output report file" << std::endl
               << "\t-i, -I  --host-ip            Server IP address (default: localhost)." << std::endl
               << "\t-p, -P, --port [num]         Server port (default: 8080)." << std::endl
@@ -393,6 +439,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         {
             {"sequence", required_argument, NULL, 's'},
             {"sequence", required_argument, NULL, 'S'},
+            {"sequence2", required_argument, NULL, '2'},
             {"report", required_argument, NULL, 'r'},
             {"report", required_argument, NULL, 'R'},
             {"host-ip", required_argument, NULL, 'i'},
@@ -406,7 +453,7 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
             {NULL, 0, NULL, 0}};
     int opt;
     // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(argc, argv, "hH?u:U:s:S:r:R:p:P:bBkK", long_options, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "hH?s:S:2:r:R:i:I:p:P:kK", long_options, NULL)) != -1) {
         switch (opt)
         {
         case 'h':
@@ -417,6 +464,9 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         case 's':
         case 'S':
             opts.sequence = optarg;
+            break;
+        case '2':
+            opts.sequence2 = optarg;
             break;
         case 'r':
         case 'R':
@@ -440,6 +490,10 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
             }
             break;
         }
+    }
+    if (!opts.sequence2.empty() && opts.sequence.empty()) {
+        std::cerr << "--sequence2 requires --sequence." << std::endl;
+        exit(EX_USAGE);
     }
 }
 
@@ -472,8 +526,9 @@ int main(int argc, char **argv) {
     }
     else {
         const std::string filename(opts.sequence);
+        const std::string filename2(opts.sequence2);
         const std::string report_file(opts.report_file);
-        rtn_code = client.ClassifySequences(filename, report_file);
+        rtn_code = client.ClassifySequences(filename, filename2, report_file);
     }
 
     std::cerr << "Return code: " << rtn_code << std::endl;

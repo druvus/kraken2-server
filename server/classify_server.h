@@ -1,5 +1,9 @@
+#pragma once
+
+#include <atomic>
 #include <iomanip>
 #include <future>
+#include <memory>
 
 // kraken2
 #include "kraken2_data.h"
@@ -42,7 +46,7 @@ struct Options {
     string host = "localhost";
     int port = 8080;
     int max_queue = 0;
-    int thread_pool = 1;
+    int thread_pool = 0;  // 0 selects the number of hardware threads
 
     string index_filename;
     string taxonomy_filename;
@@ -77,19 +81,20 @@ struct BatchResults {
 class Kraken2ServerClassifier {
 
 public:
-    bool index_available = false;
-    bool index_broken = false;
+    // Written by the loader thread, read by gRPC handler threads.
+    std::atomic<bool> index_available{false};
+    std::atomic<bool> index_broken{false};
 
     /**
-     * @brief Construct a new Kraken 2 Server Classifier. Loads the database only once and is
-     *        reused for all requests.
+     * @brief Construct a new Kraken 2 Server Classifier. Starts the thread
+     *        pool and begins loading the database asynchronously. The
+     *        database is loaded only once and reused for all requests.
      */
     Kraken2ServerClassifier(Options &options);
     ~Kraken2ServerClassifier();
 
     /**
-     * @brief Load kraken2 index
-     * 
+     * @brief Load kraken2 index options, taxonomy and hash table.
      */
     void LoadIndex();
 
@@ -98,51 +103,57 @@ public:
      */
     void ProcessSequenceStream(
         ServerContext *context, ServerStream *stream, std::string &results);
-    
-    /**
-     * @brief Classifies the vector of sequences and populates the string and map with classification
-     *        summary and results respectively.
-     */
-    bool ProcessBatch(
-        Kraken2SequenceRequestMulti reqs,
-        ThreadSafeQueue<BatchResults> *result_q);
 
     /**
-     * @brief Return a summary of historical classifications.
+     * @brief Classifies the sequences (or pairs) in a request batch and
+     *        pushes the results and per-batch counters onto result_q.
      */
-    const char *GetSummary();
+    void ProcessBatch(
+        const Kraken2SequenceRequestMulti &reqs,
+        ThreadSafeQueue<BatchResults> &result_q);
+
+    /**
+     * @brief Return a copy of the summary of historical classifications.
+     */
+    std::string GetSummary();
 
 private:
     // Database and Historical Stats
     Options opts;
-    Taxonomy taxonomy;
-    CompactHashTable hash;
+    std::unique_ptr<Taxonomy> taxonomy;
+    std::unique_ptr<KeyValueStore> hash;
     IndexOptions idx_opts;
     taxon_counters_t total_taxon_counters;
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
     std::mutex stats_mtx;
     BS::thread_pool pool;
+    std::thread loader;
 
     void AddHitlistString(ostringstream &oss, vector<taxid_t> &taxa, Taxonomy &taxonomy);
 
+    /**
+     * @brief Classify one fragment. dna2 is the mate for paired reads and
+     *        nullptr for single-end reads.
+     */
     Kraken2SequenceResult ClassifySequence(
-        Sequence &dna,
-        CompactHashTable &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
+        Sequence &dna, Sequence *dna2,
+        KeyValueStore &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
         Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
         vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
         vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts);
 
-    void MaskLowQualityBases(Sequence &dna, int minimum_quality_score);
+    /**
+     * @brief Replace bases below the quality threshold with 'x'. Returns
+     *        false if the sequence and quality strings differ in length.
+     */
+    bool MaskLowQualityBases(Sequence &dna, int minimum_quality_score);
 
-    void ProcessFile(
-        Sequence &seq,
-        CompactHashTable &hash, Taxonomy &tax,
-        IndexOptions &idx_opts, Options &opts, ClassificationStats &stats,
-        taxon_counters_t &total_taxon_counters,
-        Kraken2SequenceResult &classification,
-        MinimizerScanner &scanner, vector<taxid_t> &taxa,
-        taxon_counts_t &hit_counts, vector<string> &translated_frames, SequenceFormat &format);
+    /**
+     * @brief Build an unclassified result for a read that could not be
+     *        processed.
+     */
+    Kraken2SequenceResult UnclassifiedResult(const Sequence &dna, const Sequence *dna2);
 
     std::string ReportStats(struct timeval time1, struct timeval time2, ClassificationStats &stats);
 

@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.0]
+### Added
+- Paired-end classification. The client accepts a mate file with `--sequence2`
+  and the server classifies each pair as one fragment, matching `kraken2 --paired`
+  (pooled minimizers, `|:|` marker in the hit list, `len1|len2` length column,
+  `/1` and `/2` stripped from the read id). Pairing is decided per read, so
+  single-end and paired-end clients can share a server.
+### Changed
+- Kraken2 submodule updated from 2.1.2 to 2.17.2 (commit 01fb1d9). The server
+  now reads databases with 40-bit hash cells and uses batched hash lookups.
+  Per-read output and reports are identical to `kraken2` 2.17.2.
+- The taxonomy and hash table are loaded in the background after the server
+  starts listening, as the client readiness check already assumed.
+- The classification thread pool defaults to the number of hardware threads
+  instead of one thread.
+- The client no longer sends the full header line and a text copy of each
+  record, and the server no longer sends the scientific name per read. Both
+  fields were unused and roughly doubled the request size.
+- Result batches are handed to the writer thread through a blocking queue
+  instead of two busy-waiting loops, and read batches are moved rather than
+  copied between the reader, the queue and the gRPC messages on both sides.
+- The server limits the number of request batches buffered per stream, so a
+  fast client cannot make the server hold its whole input in memory.
+### Fixed
+- A FASTQ record whose quality string length differs from its sequence, with
+  `--min-quality` set, is reported as unclassified instead of terminating the
+  server. The client now reports truncated or unreadable records and exits
+  with a non-zero status rather than treating them as end of input.
+- The classification summary was read without locking while another stream
+  could be rewriting it.
+- Ctrl-C during database load waits for the loader thread instead of
+  destroying the classifier underneath it. A second shutdown signal no longer
+  throws.
+- Statistics for an empty stream printed NaN percentages.
+- The client `-i` / `-I` short options for `--host-ip` were not accepted.
+- The client closed an uninitialised file handle when a reader was destroyed.
+- The client exits with a non-zero status when an input file cannot be opened
+  or when paired-end inputs contain different numbers of reads.
+
 ## [v0.1.8]
 ### Fixed
 - Receive size of messages in client raised to accomodate larger requests.

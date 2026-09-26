@@ -44,6 +44,9 @@ message Kraken2SequenceRequest {
   string seq = 4;
   string quals = 5;
   string str_representation = 6;
+  // Second read of a pair. Absent for single-end reads. When present the
+  // server classifies both reads as one fragment.
+  Kraken2SequenceRequest mate = 7;
 }
 
 message Kraken2SequenceRequestMulti {
@@ -58,6 +61,9 @@ message Kraken2SequenceResult {
   string name = 4;
   uint32 size = 5;
   string hitlist = 6;
+  // True when the result covers a read pair; size2 is then the mate length.
+  bool paired = 7;
+  uint32 size2 = 8;
 }
 
 message Kraken2SequenceResultMulti {
