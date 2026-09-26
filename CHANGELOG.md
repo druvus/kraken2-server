@@ -6,6 +6,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.2.0]
 ### Added
+- Classification against several databases at once (`--db` repeated),
+  matching `k2 classify --db a,b` in Kraken 2.17: a merged taxonomy is built
+  from the databases' taxonomies and each read is called from the LCA of its
+  hits across databases. Output is identical to `k2` on the test databases.
+  Design in `docs/MULTI_DB.md`.
 - TLS. The server takes `--tls-cert` and `--tls-key`, and `--tls-ca` to
   require client certificates. The client takes `--tls`, `--tls-ca`,
   `--tls-cert`, `--tls-key` and `--tls-server-name`. Without these the

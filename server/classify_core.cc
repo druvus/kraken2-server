@@ -134,6 +134,30 @@ taxid_t ResolveTree(taxon_counts_t &hit_counts, const Taxonomy &taxonomy,
     return max_taxon;
 }
 
+void MergeTaxonVectors(const std::vector<std::vector<taxid_t>> &per_database,
+                       const Taxonomy &merged, std::vector<taxid_t> &out)
+{
+    out.clear();
+    if (per_database.empty()) return;
+    const size_t n = per_database[0].size();
+    out.reserve(n);
+    for (size_t i = 0; i < n; i++)
+    {
+        taxid_t t = per_database[0][i];
+        if (t == AMBIGUOUS_SPAN_TAXON || t == MATE_PAIR_BORDER_TAXON ||
+            t == READING_FRAME_BORDER_TAXON)
+        {
+            out.push_back(t);
+            continue;
+        }
+        for (size_t d = 1; d < per_database.size(); d++)
+        {
+            t = merged.LowestCommonAncestor(t, per_database[d][i]);
+        }
+        out.push_back(t);
+    }
+}
+
 std::string DoubleStatToString(double d, int precision)
 {
     std::stringstream stream;

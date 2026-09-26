@@ -59,6 +59,26 @@ The report file adds a header line before the standard kraken2 report
 columns.
 
 
+## Several databases
+
+`--db` may be repeated. Reads are then looked up in every database and the
+results combined the way `k2 classify --db a,b` does in Kraken 2.17: a
+merged taxonomy is built from the databases' taxonomies, each minimizer's
+taxa across databases are reduced to their lowest common ancestor, and the
+read is called from the merged hits.
+
+```
+kraken2_server --db archaea --db viral --db univec
+```
+
+The databases must be built with the same k-mer and minimizer settings and
+must all be nucleotide or all protein. Their taxonomies must agree on the
+parent of every shared taxid. Memory use is the sum of the databases. With
+several databases the merged call is made with confidence 0 and without the
+hit-group filter, as kraken2's merge program does; `--confidence` and
+`--hit-groups` therefore have no effect. Output is identical to `k2` on the
+test databases (`testing/parity_test.sh`). See `docs/MULTI_DB.md`.
+
 ## Python client
 
 `python/` holds a Python package with the same protocol and output as the

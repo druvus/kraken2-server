@@ -154,6 +154,67 @@ else
     echo "SKIP  translated search test (kraken2-build not available or protein database build failed)"
 fi
 
+# Multi-database classification against k2 classify --db a,b, using two
+# tiny nucleotide databases that share one species (make_multidb.sh).
+MULTI=multidb
+if command -v kraken2-build > /dev/null && command -v k2 > /dev/null && ./make_multidb.sh $MULTI > $WORK/multidb.log 2>&1; then
+    echo "+++ Multi-database classification +++"
+    k2 classify --db $MULTI/dbA,$MULTI/dbB --threads 2 \
+        --report $WORK/ref_multi.report --output $WORK/ref_multi.out $MULTI/reads.fq > $WORK/k2_multi.log 2>&1
+    check "reference k2 multi-database run" 0 $?
+    k2 classify --db $MULTI/dbA,$MULTI/dbB --threads 2 --paired \
+        --report $WORK/ref_multi_p.report --output $WORK/ref_multi_p.out $MULTI/reads_1.fq $MULTI/reads_2.fq > $WORK/k2_multi_p.log 2>&1
+    check "reference k2 multi-database paired run" 0 $?
+    check "reference classifies species from both databases" 3 "$(awk '$1=="C"{print $3}' $WORK/ref_multi.out | sort -u | wc -l | tr -d ' ')"
+
+    "$SERVER" --allow-remote-shutdown --db $MULTI/dbA --db $MULTI/dbB --host-ip 127.0.0.1 --port $PORT > $WORK/server_multi.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 2
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $MULTI/reads.fq \
+        --report $WORK/multi.report > $WORK/multi.out 2> $WORK/multi.err
+    check "multi-database client exit code" 0 $?
+    check "multi-database output identical to k2" 0 "$(diff $WORK/multi.out $WORK/ref_multi.out | grep -c '^[<>]')"
+    check "multi-database report identical to k2" 0 "$(diff <(tail -n +2 $WORK/multi.report) $WORK/ref_multi.report | grep -c '^[<>]')"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $MULTI/reads_1.fq --sequence2 $MULTI/reads_2.fq \
+        --report $WORK/multi_p.report > $WORK/multi_p.out 2> $WORK/multi_p.err
+    check "multi-database paired output identical to k2" 0 "$(diff $WORK/multi_p.out $WORK/ref_multi_p.out | grep -c '^[<>]')"
+    check "multi-database paired report identical to k2" 0 "$(diff <(tail -n +2 $WORK/multi_p.report) $WORK/ref_multi_p.report | grep -c '^[<>]')"
+    check "server built a merged taxonomy" 1 "$(grep -c 'Merged taxonomy has' $WORK/server_multi.log)"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    check "multi-database server exit code" 0 $?
+    trap - EXIT
+
+    # a single database must give the same output as before the merge code
+    "$SERVER" --allow-remote-shutdown --db $MULTI/dbA --host-ip 127.0.0.1 --port $PORT > $WORK/server_dbA.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 2
+    kraken2 --db $MULTI/dbA --minimum-hit-groups 2 --output $WORK/ref_dbA.out $MULTI/reads.fq > /dev/null 2>&1
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $MULTI/reads.fq > $WORK/dbA.out 2> /dev/null
+    check "single small database identical to kraken2" 0 "$(diff $WORK/dbA.out $WORK/ref_dbA.out | grep -c '^[<>]')"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    trap - EXIT
+
+    # databases built with different settings are refused
+    if [ -f $PROT_DB/hash.k2d ]; then
+        "$SERVER" --db $MULTI/dbA --db $PROT_DB --host-ip 127.0.0.1 --port $PORT > $WORK/server_mixed.log 2>&1 &
+        SERVER_PID=$!
+        trap 'kill $SERVER_PID 2> /dev/null' EXIT
+        sleep 2
+        check "mismatched databases refused at load" 1 "$(grep -c 'different k-mer' $WORK/server_mixed.log)"
+        "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $MULTI/reads.fq > /dev/null 2> $WORK/mixed_client.err
+        check "client reports the broken index" 9 $?
+        kill -TERM $SERVER_PID
+        wait $SERVER_PID 2> /dev/null
+        trap - EXIT
+    fi
+else
+    echo "SKIP  multi-database test (kraken2-build or k2 not available, or database build failed)"
+fi
+
 # TLS between client and server, and the remote shutdown gate. Certificates
 # are self-signed and generated into the work directory (needs openssl).
 if command -v openssl > /dev/null; then

@@ -1,6 +1,7 @@
 # Pure classification helpers and report wrapper, shared with the unit tests
 add_library(kraken2_server_core
     classify_core.cc
+    merged_taxonomy.cc
     report_server.cc)
 
 target_include_directories(kraken2_server_core PUBLIC .)

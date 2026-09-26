@@ -17,6 +17,7 @@
 
 // kraken2 server
 #include "classify_core.h"
+#include "merged_taxonomy.h"
 #include "worker_pool.h"
 #include "report_server.h"
 #include "thread_safe_queue.h"
@@ -44,15 +45,14 @@ using kraken2server::ClassificationStats;
 
 
 struct Options {
-    string db_path;
+    // One or more kraken2 database directories. With several, reads are
+    // classified against all of them and the results merged (docs/MULTI_DB.md).
+    std::vector<string> db_paths;
     string host = "localhost";
     int port = 8080;
     int max_queue = 0;
     int thread_pool = 0;  // 0 selects the number of hardware threads
 
-    string index_filename;
-    string taxonomy_filename;
-    string options_filename;
     string report_filename = "latest_run.txt";
     bool report_kmer_data = false;
     bool report_zero_counts = false;
@@ -74,6 +74,19 @@ struct Options {
 };
 
 
+
+
+// One loaded kraken2 database.
+struct Index {
+    string name;                       // directory basename, for messages
+    string path;
+    IndexOptions options;
+    std::unique_ptr<Taxonomy> taxonomy;
+    std::unique_ptr<KeyValueStore> hash;
+    // internal id in this taxonomy -> internal id in the merged taxonomy
+    // (identity when there is a single database)
+    std::vector<taxid_t> to_merged;
+};
 
 
 struct BatchResults {
@@ -128,9 +141,16 @@ public:
 private:
     // Database and Historical Stats
     Options opts;
-    std::unique_ptr<Taxonomy> taxonomy;
-    std::unique_ptr<KeyValueStore> hash;
+    std::vector<Index> indexes;
+    // The taxonomy results are expressed in: the single database's own
+    // taxonomy, or the merged taxonomy for several databases.
+    std::unique_ptr<Taxonomy> merged_taxonomy;
+    Taxonomy *taxonomy = nullptr;
+    // Scanner parameters shared by all databases.
     IndexOptions idx_opts;
+    // Smallest minimum_acceptable_hash_value over databases; keys below it
+    // are not looked up anywhere.
+    uint64_t min_hash_any = 0;
     taxon_counters_t total_taxon_counters;
     ClassificationStats total_stats = {0, 0, 0};
     std::string summary;
@@ -144,10 +164,12 @@ private:
      */
     Kraken2SequenceResult ClassifySequence(
         Sequence &dna, Sequence *dna2,
-        KeyValueStore &hash, Taxonomy &taxonomy, IndexOptions &idx_opts,
-        Options &opts, ClassificationStats &stats, MinimizerScanner &scanner,
+        ClassificationStats &stats, MinimizerScanner &scanner,
         vector<taxid_t> &taxa, taxon_counts_t &hit_counts,
         vector<string> &tx_frames, taxon_counters_t &curr_taxon_counts);
+
+    // Load one database directory into an Index.
+    Index LoadOne(const std::string &path);
 
     /**
      * @brief Replace bases below the quality threshold with 'x'. Returns

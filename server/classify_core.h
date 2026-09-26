@@ -44,6 +44,13 @@ namespace kraken2server
     taxid_t ResolveTree(taxon_counts_t &hit_counts, const Taxonomy &taxonomy,
                         size_t total_minimizers, double confidence_threshold);
 
+    // Combine the per-database taxon vectors of one read into one vector in
+    // the merged taxonomy: position by position, the lowest common ancestor
+    // over databases, where LCA(x, 0) = x. Marker values pass through. All
+    // vectors must have the same length. Mirrors kraken2's merge program.
+    void MergeTaxonVectors(const std::vector<std::vector<taxid_t>> &per_database,
+                           const Taxonomy &merged, std::vector<taxid_t> &out);
+
     std::string DoubleStatToString(double d, int precision);
 
     // Human readable summary of one stream, kraken2 style.

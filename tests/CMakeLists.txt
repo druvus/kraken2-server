@@ -10,7 +10,8 @@ add_executable(unit_tests
     test_messages.cc
     test_cli.cc
     test_worker_pool.cc
-    test_translate.cc)
+    test_translate.cc
+    test_merged_taxonomy.cc)
 
 target_link_libraries(unit_tests
     doctest::doctest

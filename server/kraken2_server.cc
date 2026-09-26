@@ -226,13 +226,8 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
 void ParseCommandLine(int argc, char **argv, Options &opts) {
     using cli::Parser;
     Parser parser("kraken2_server");
-    parser.add({"db", 'd', true, "[path]", "Path to Kraken 2 database",
-        [&](const std::string &v) {
-            opts.db_path = v;
-            opts.taxonomy_filename = v + "/taxo.k2d";
-            opts.options_filename = v + "/opts.k2d";
-            opts.index_filename = v + "/hash.k2d";
-        }, true});
+    parser.add({"db", 'd', true, "[path]", "Path to a Kraken 2 database. May be repeated to classify against several databases at once (see docs/MULTI_DB.md)",
+        [&](const std::string &v) { opts.db_paths.push_back(v); }, true});
     parser.add({"max-requests", 'r', true, "[int]", "Max number of client requests processed concurrently (0 for default)",
         [&](const std::string &v) { opts.max_queue = Parser::ParseInt(v, "--max-requests", 0, 100000); }});
     parser.add({"thread-pool", 'x', true, "[int]", "Classification threads shared by all clients (0, the default, uses all hardware threads)",
