@@ -7,7 +7,8 @@ add_executable(unit_tests
     test_classify_core.cc
     test_report.cc
     test_thread_safe_queue.cc
-    test_messages.cc)
+    test_messages.cc
+    test_cli.cc)
 
 target_link_libraries(unit_tests
     doctest::doctest

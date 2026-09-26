@@ -3,7 +3,6 @@
 #include <chrono>
 #include <fstream>
 #include <future>
-#include <getopt.h>
 #include <random>
 #include <thread>
 #include <sysexits.h>
@@ -14,6 +13,7 @@
 #include <grpc++/create_channel.h>
 #include <grpc++/security/credentials.h>
 
+#include "cli.h"
 #include "utils.h"
 #include "thread_safe_queue.h"
 #include "Kraken2.grpc.pb.h"
@@ -417,79 +417,30 @@ private:
     }
 };
 
-void Usage(int exit_code) {
-    std::cerr << "Usage: kraken2-client [options]" << std::endl
-              << std::endl
-              << "\t-h, -H, -?, --help           Usage" << std::endl
-              << "\t-s, -S, --sequence [path]    Path to sequence file (*.fast(a|q)(.gz), or - for stdin" << std::endl
-              << "\t-2,     --sequence2 [path]   Path to mate file for paired-end reads (same order as --sequence)" << std::endl
-              << "\t-r, -R  --report   [path]    Path to output report file" << std::endl
-              << "\t-i, -I  --host-ip            Server IP address (default: localhost)." << std::endl
-              << "\t-p, -P, --port [num]         Server port (default: 8080)." << std::endl
-              << "\t-k, -K, --shutdown           Shutdown server" << std::endl
-              << std::endl
-              << "Leave sequence blank to request the total summary data from the specified endpoint." << std::endl
-              << std::endl;
-    exit(exit_code);
-}
-
 void ParseCommandLine(int argc, char **argv, Options &opts) {
-    // Define the long shell arguments
-    struct option long_options[] =
-        {
-            {"sequence", required_argument, NULL, 's'},
-            {"sequence", required_argument, NULL, 'S'},
-            {"sequence2", required_argument, NULL, '2'},
-            {"report", required_argument, NULL, 'r'},
-            {"report", required_argument, NULL, 'R'},
-            {"host-ip", required_argument, NULL, 'i'},
-            {"host-ip", required_argument, NULL, 'I'},
-            {"port", required_argument, NULL, 'p'},
-            {"port", required_argument, NULL, 'P'},
-            {"shutdown", no_argument, NULL, 'k'},
-            {"shutdown", no_argument, NULL, 'K'},
-            {"help", no_argument, NULL, 'h'},
-            {"help", no_argument, NULL, 'H'},
-            {NULL, 0, NULL, 0}};
-    int opt;
-    // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(argc, argv, "hH?s:S:2:r:R:i:I:p:P:kK", long_options, NULL)) != -1) {
-        switch (opt)
-        {
-        case 'h':
-        case '?':
-        case 'H':
-            Usage(0);
-            break;
-        case 's':
-        case 'S':
-            opts.sequence = optarg;
-            break;
-        case '2':
-            opts.sequence2 = optarg;
-            break;
-        case 'r':
-        case 'R':
-            opts.report_file = optarg;
-            break;
-        case 'k':
-        case 'K':
-            opts.shutdown = true;
-            break;
-        case 'i':
-        case 'I':
-            opts.host = optarg;
-            break;
-        case 'p':
-        case 'P':
-            opts.port = atoi(optarg);
-            if (opts.port < 0 || opts.port > 65535)
-            {
-                std::cerr << "Port number not valid (0 - 65535)" << std::endl;
-                exit(EX_USAGE);
-            }
-            break;
-        }
+    using cli::Parser;
+    Parser parser("kraken2_client");
+    parser.add({"sequence", 's', true, "[path]", "Path to sequence file (*.fast(a|q)(.gz)), or - for stdin. Omit to request the server summary.",
+        [&](const std::string &v) { opts.sequence = v; }});
+    parser.add({"sequence2", '2', true, "[path]", "Path to mate file for paired-end reads (same order as --sequence)",
+        [&](const std::string &v) { opts.sequence2 = v; }});
+    parser.add({"report", 'r', true, "[path]", "Path to output report file",
+        [&](const std::string &v) { opts.report_file = v; }});
+    parser.add({"host-ip", 'i', true, "[addr]", "Server IP address (default: localhost)",
+        [&](const std::string &v) { opts.host = v; }});
+    parser.add({"port", 'p', true, "[int]", "Server port (default: 8080)",
+        [&](const std::string &v) { opts.port = Parser::ParseInt(v, "--port", 0, 65535); }});
+    parser.add({"shutdown", 'k', false, "", "Shutdown server",
+        [&](const std::string &) { opts.shutdown = true; }});
+
+    cli::Result result = parser.parse(argc, argv);
+    if (result.status == cli::Status::Help) {
+        std::cerr << parser.usage();
+        exit(0);
+    }
+    if (result.status == cli::Status::Error) {
+        std::cerr << result.message << std::endl << std::endl << parser.usage();
+        exit(EX_USAGE);
     }
     if (!opts.sequence2.empty() && opts.sequence.empty()) {
         std::cerr << "--sequence2 requires --sequence." << std::endl;
