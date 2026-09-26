@@ -49,10 +49,13 @@ set(_GRPC_GRPCPP gRPC::grpc++)
 # gRPC headers use absl::Mutex inline, so every target that includes them
 # must link abseil directly; GNU ld does not pick it up transitively from
 # the shared gRPC library.
+find_package(absl CONFIG QUIET)
 if(TARGET absl::synchronization)
     set(_ABSL_SYNC absl::synchronization)
+    message(STATUS "Linking abseil synchronization explicitly")
 else()
     set(_ABSL_SYNC "")
+    message(STATUS "abseil targets not found; relying on gRPC's link interface")
 endif()
 
 # Find and set a var for the exectuable for gRPC C++ plugin
