@@ -69,7 +69,7 @@ for f in ref_single.out ref_single.report ref_paired.out ref_paired.report; do
 done
 
 echo "+++ Starting server on port $PORT +++"
-"$SERVER" --db $DB --host-ip 127.0.0.1 --port $PORT > $WORK/server.log 2>&1 &
+"$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $PORT > $WORK/server.log 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2> /dev/null' EXIT
 sleep 3
@@ -121,7 +121,7 @@ if command -v kraken2-build > /dev/null && ./make_protein_db.sh $PROT_DB > $WORK
     # the synthetic reads all derive from the library, so kraken2 should classify them
     check "reference classifies every synthetic protein read" 0 "$(awk '$1=="U"' $WORK/ref_prot.out | wc -l | tr -d ' ')"
 
-    "$SERVER" --db $PROT_DB --host-ip 127.0.0.1 --port $PORT > $WORK/server_prot.log 2>&1 &
+    "$SERVER" --allow-remote-shutdown --db $PROT_DB --host-ip 127.0.0.1 --port $PORT > $WORK/server_prot.log 2>&1 &
     SERVER_PID=$!
     trap 'kill $SERVER_PID 2> /dev/null' EXIT
     sleep 2
@@ -142,7 +142,7 @@ if command -v kraken2-build > /dev/null && ./make_protein_db.sh $PROT_DB > $WORK
     trap - EXIT
 
     echo "+++ --translated-search with a nucleotide database +++"
-    "$SERVER" --db $DB --translated-search --host-ip 127.0.0.1 --port $PORT > $WORK/server_warn.log 2>&1 &
+    "$SERVER" --allow-remote-shutdown --db $DB --translated-search --host-ip 127.0.0.1 --port $PORT > $WORK/server_warn.log 2>&1 &
     SERVER_PID=$!
     trap 'kill $SERVER_PID 2> /dev/null' EXIT
     sleep 3
@@ -152,6 +152,54 @@ if command -v kraken2-build > /dev/null && ./make_protein_db.sh $PROT_DB > $WORK
     check "warning when --translated-search given for nucleotide database" 1 "$(grep -c 'Warning: --translated-search' $WORK/server_warn.log)"
 else
     echo "SKIP  translated search test (kraken2-build not available or protein database build failed)"
+fi
+
+# TLS between client and server, and the remote shutdown gate. Certificates
+# are self-signed and generated into the work directory (needs openssl).
+if command -v openssl > /dev/null; then
+    echo "+++ TLS +++"
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=localhost" \
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+        -keyout $WORK/server.key -out $WORK/server.crt > /dev/null 2>&1
+    openssl req -x509 -newkey rsa:2048 -nodes -days 2 -subj "/CN=client" \
+        -keyout $WORK/client.key -out $WORK/client.crt > /dev/null 2>&1
+    check "test certificates generated" 1 "$([ -s $WORK/server.crt ] && [ -s $WORK/client.crt ] && echo 1)"
+
+    # server-only TLS, remote shutdown not allowed
+    "$SERVER" --db $DB --host-ip 127.0.0.1 --port $PORT --tls-cert $WORK/server.crt --tls-key $WORK/server.key > $WORK/server_tls.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 3
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --tls-ca $WORK/server.crt --sequence $WORK/r1.fq.gz --sequence2 $WORK/r2.fq.gz > $WORK/tls.out 2> $WORK/tls.err
+    check "TLS paired-end client exit code" 0 $?
+    check "TLS paired-end output identical" 0 "$(diff $WORK/tls.out $WORK/ref_paired.out | grep -c '^[<>]')"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $WORK/r1.fq.gz > /dev/null 2> $WORK/plain_vs_tls.err
+    check "plain client against TLS server fails" 69 $?
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --tls-ca $WORK/server.crt --shutdown > /dev/null 2> $WORK/shutdown_denied.err
+    check "remote shutdown refused without --allow-remote-shutdown" 7 $?
+    check "server still running after refused shutdown" 0 "$(kill -0 $SERVER_PID 2> /dev/null; echo $?)"
+    kill -TERM $SERVER_PID
+    wait $SERVER_PID
+    check "server exits cleanly on SIGTERM" 0 $?
+    trap - EXIT
+
+    # mutual TLS
+    "$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $PORT --tls-cert $WORK/server.crt --tls-key $WORK/server.key --tls-ca $WORK/client.crt > $WORK/server_mtls.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 3
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --tls-ca $WORK/server.crt --sequence $WORK/r1.fq.gz > /dev/null 2> $WORK/nocert.err
+    check "client without certificate rejected by mutual TLS server" 69 $?
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --tls-ca $WORK/server.crt --tls-cert $WORK/client.crt --tls-key $WORK/client.key --sequence $READS > $WORK/mtls.out 2> $WORK/mtls.err
+    check "mutual TLS client exit code" 0 $?
+    check "mutual TLS output identical" 0 "$(diff $WORK/mtls.out $WORK/ref_single.out | grep -c '^[<>]')"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --tls-ca $WORK/server.crt --tls-cert $WORK/client.crt --tls-key $WORK/client.key --shutdown > /dev/null 2>&1
+    check "remote shutdown over mutual TLS" 0 $?
+    wait $SERVER_PID
+    check "mutual TLS server exit code" 0 $?
+    trap - EXIT
+else
+    echo "SKIP  TLS test (openssl not available)"
 fi
 
 # Server-side handling of records whose quality string length differs from
@@ -165,7 +213,7 @@ if [ -x "$RAW_CLIENT" ]; then
         printf "badqual\t%s\t%s\n", s, substr(q, 1, length(q) - 10);
         printf "pair_badmate\t%s\t%s\t%s\t%s\n", s, q, s, substr(q, 1, 5);
         printf "after\t%s\t%s\n", s, q; exit }' > $WORK/records.tsv
-    "$SERVER" --db $DB --host-ip 127.0.0.1 --port $PORT --min-quality 10 > $WORK/server_mq.log 2>&1 &
+    "$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $PORT --min-quality 10 > $WORK/server_mq.log 2>&1 &
     SERVER_PID=$!
     trap 'kill $SERVER_PID 2> /dev/null' EXIT
     sleep 3

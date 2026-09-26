@@ -11,6 +11,7 @@
 
 #include "cli.h"
 #include "messages.h"
+#include "utils.h"
 #include "classify_server.h"
 
 using grpc::ResourceQuota;
@@ -92,6 +93,14 @@ public:
     Status RemoteShutdown(
             ServerContext *context, const Kraken2ShutdownRequest *req,
             kraken2proto::Kraken2ShutdownResult *result) override {
+        if (!options.allow_remote_shutdown) {
+            std::cerr << "Refused a remote shutdown request; start with "
+                      << "--allow-remote-shutdown to permit it." << std::endl;
+            result->set_successful(false);
+            return Status(StatusCode::PERMISSION_DENIED,
+                          "Remote shutdown is disabled on this server. "
+                          "Start it with --allow-remote-shutdown to permit it.");
+        }
         std::cerr << "Received shutdown request." << std::endl;
         RequestExit();
         result->set_successful(true);
@@ -154,7 +163,36 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     // docs on unit of memory allocation - not recommended
     // rq.Resize(new_memory_allocation);
     ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    std::shared_ptr<grpc::ServerCredentials> credentials;
+    if (!opts.tls_cert.empty() && !opts.tls_key.empty()) {
+        grpc::SslServerCredentialsOptions ssl_opts(
+            opts.tls_ca.empty()
+                ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
+                : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
+        try {
+            grpc::SslServerCredentialsOptions::PemKeyCertPair pair;
+            pair.private_key = read_file(opts.tls_key);
+            pair.cert_chain = read_file(opts.tls_cert);
+            ssl_opts.pem_key_cert_pairs.push_back(pair);
+            if (!opts.tls_ca.empty()) {
+                ssl_opts.pem_root_certs = read_file(opts.tls_ca);
+            }
+        }
+        catch (const std::exception &ex) {
+            std::cerr << "Cannot configure TLS: " << ex.what() << std::endl;
+            return;
+        }
+        credentials = grpc::SslServerCredentials(ssl_opts);
+        std::cout << "TLS enabled"
+                  << (opts.tls_ca.empty() ? "." : " with client certificate verification.")
+                  << std::endl;
+    } else {
+        credentials = grpc::InsecureServerCredentials();
+        std::cout << "Warning: TLS is not enabled; connections are unencrypted and "
+                  << "unauthenticated. Use --tls-cert and --tls-key on untrusted networks."
+                  << std::endl;
+    }
+    builder.AddListeningPort(server_address, credentials);
     // don't use port if already in use
     builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
     builder.SetResourceQuota(rq);
@@ -221,6 +259,14 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         [&](const std::string &) { opts.use_memory_mapping = true; }});
     parser.add({"wait", 'w', true, "[int]", "Delay database loading by this many seconds (for testing)",
         [&](const std::string &v) { opts.wait = Parser::ParseInt(v, "--wait", 0, 100000); }});
+    parser.add({"tls-cert", 0, true, "[path]", "PEM certificate chain; with --tls-key enables TLS",
+        [&](const std::string &v) { opts.tls_cert = v; }});
+    parser.add({"tls-key", 0, true, "[path]", "PEM private key for --tls-cert",
+        [&](const std::string &v) { opts.tls_key = v; }});
+    parser.add({"tls-ca", 0, true, "[path]", "PEM CA bundle; when given, clients must present a certificate signed by it",
+        [&](const std::string &v) { opts.tls_ca = v; }});
+    parser.add({"allow-remote-shutdown", 0, false, "", "Permit clients to stop the server with --shutdown (default: refused)",
+        [&](const std::string &) { opts.allow_remote_shutdown = true; }});
 
     cli::Result result = parser.parse(argc, argv);
     if (result.status == cli::Status::Help) {
@@ -229,6 +275,14 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
     }
     if (result.status == cli::Status::Error) {
         std::cerr << result.message << std::endl << std::endl << parser.usage();
+        exit(EX_USAGE);
+    }
+    if (opts.tls_cert.empty() != opts.tls_key.empty()) {
+        std::cerr << "--tls-cert and --tls-key must be given together." << std::endl;
+        exit(EX_USAGE);
+    }
+    if (!opts.tls_ca.empty() && opts.tls_cert.empty()) {
+        std::cerr << "--tls-ca requires --tls-cert and --tls-key." << std::endl;
         exit(EX_USAGE);
     }
 }

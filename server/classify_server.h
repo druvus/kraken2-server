@@ -63,6 +63,14 @@ struct Options {
     int minimum_hit_groups = 2;
     bool use_memory_mapping = false;
     int wait = 0;
+
+    // Transport security. TLS is enabled when both tls_cert and tls_key are
+    // given; tls_ca additionally requires and verifies client certificates.
+    string tls_cert;
+    string tls_key;
+    string tls_ca;
+    // The RemoteShutdown RPC is refused unless this is set.
+    bool allow_remote_shutdown = false;
 };
 
 

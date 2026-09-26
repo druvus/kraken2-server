@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [v0.2.0]
 ### Added
+- TLS. The server takes `--tls-cert` and `--tls-key`, and `--tls-ca` to
+  require client certificates. The client takes `--tls`, `--tls-ca`,
+  `--tls-cert`, `--tls-key` and `--tls-server-name`. Without these the
+  server prints a warning and runs unencrypted as before.
+- `--allow-remote-shutdown` on the server. The `RemoteShutdown` RPC is
+  refused with `PERMISSION_DENIED` unless it is given.
 - Paired-end classification. The client accepts a mate file with `--sequence2`
   and the server classifies each pair as one fragment, matching `kraken2 --paired`
   (pooled minimizers, `|:|` marker in the hit list, `len1|len2` length column,

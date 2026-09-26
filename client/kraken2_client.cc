@@ -51,6 +51,13 @@ struct Options
     std::string host = "localhost";
     int port = 8080;
     bool shutdown = false;
+    // TLS: enabled by --tls or any --tls-* option. tls_ca overrides the system
+    // roots; tls_cert and tls_key present a client certificate.
+    bool tls = false;
+    std::string tls_ca;
+    std::string tls_cert;
+    std::string tls_key;
+    std::string tls_server_name;  // expected certificate name when it differs from the host
 };
 
 typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequestMulti, Kraken2SequenceStreamResult>> ClientStream;
@@ -163,7 +170,8 @@ public:
         Kraken2ShutdownResult response;
         Status status = sequence_stub->RemoteShutdown(&context, req, &response);
         if (!status.ok()) {
-            std::cerr << "Failed to send shutdown request." << std::endl;
+            std::cerr << "Failed to send shutdown request: " << status.error_message() << std::endl;
+            return status.error_code();
         }
         if (response.successful()) {
             std::cerr << "Shutdown request processed." << std::endl;
@@ -342,41 +350,42 @@ private:
     std::atomic<bool> pairs_mismatched{false};
 
     int WaitForServer() {
-        // wait for server
+        // The server answers UNAVAILABLE with a message starting "Index not
+        // loaded" while its database loads; wait for that indefinitely.
+        // Any other UNAVAILABLE comes from the transport (connection refused,
+        // TLS mismatch) and is retried only a few times.
+        const int max_connect_attempts = 5;
+        int connect_attempts = 0;
         while (true) {
             ClientContext context;
             Kraken2ReadyRequest req;
             Kraken2ReadyResult response;
-            Status status;
-            try {
-                status = sequence_stub->ServerReady(&context, req, &response);
-                if (status.ok())
-                {
-                    std::cerr << "Server responded as ready." << std::endl;
-                    break;
-                }
+            Status status = sequence_stub->ServerReady(&context, req, &response);
+            if (status.ok()) {
+                std::cerr << "Server responded as ready." << std::endl;
+                return EX_OK;
             }
-            // complete failure
-            catch (const std::exception &ex) {
-                std::cerr << "Server status check failed: "
-                          << ex.what() << std::endl;
-                return EX_UNAVAILABLE;
-            }
-            // not ready condition
-            if (status.error_code() == grpc::StatusCode::UNAVAILABLE) {
-                // server may come back
-                std::cerr << "Server is not ready: " << status.error_message() << std::endl;
-                std::cerr << "Waiting 10s..." << std::endl;
-                std::this_thread::sleep_for(10s);
-            }
-            // unknown error
-            else {
+            if (status.error_code() != grpc::StatusCode::UNAVAILABLE) {
                 std::cerr << "Server is in error state: "
                           << status.error_message() << std::endl;
                 return status.error_code();
             }
+            if (status.error_message().rfind("Index not loaded", 0) == 0) {
+                std::cerr << "Server is not ready: " << status.error_message() << std::endl;
+                std::cerr << "Waiting 10s..." << std::endl;
+                std::this_thread::sleep_for(10s);
+                continue;
+            }
+            connect_attempts++;
+            std::cerr << "Cannot reach server (" << connect_attempts << "/" << max_connect_attempts
+                      << "): " << status.error_message() << std::endl;
+            if (connect_attempts >= max_connect_attempts) {
+                std::cerr << "Giving up. Check the address and port, and whether the "
+                          << "server requires TLS (--tls, --tls-ca)." << std::endl;
+                return EX_UNAVAILABLE;
+            }
+            std::this_thread::sleep_for(2s);
         }
-        return EX_OK;
     }
 
     void PrintSummary(const std::string &summary, const std::string &report_file) {
@@ -430,6 +439,16 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         [&](const std::string &v) { opts.port = Parser::ParseInt(v, "--port", 0, 65535); }});
     parser.add({"shutdown", 'k', false, "", "Shutdown server",
         [&](const std::string &) { opts.shutdown = true; }});
+    parser.add({"tls", 't', false, "", "Connect with TLS using the system CA roots",
+        [&](const std::string &) { opts.tls = true; }});
+    parser.add({"tls-ca", 0, true, "[path]", "PEM CA bundle to verify the server (implies --tls)",
+        [&](const std::string &v) { opts.tls_ca = v; opts.tls = true; }});
+    parser.add({"tls-cert", 0, true, "[path]", "PEM client certificate for mutual TLS (implies --tls)",
+        [&](const std::string &v) { opts.tls_cert = v; opts.tls = true; }});
+    parser.add({"tls-key", 0, true, "[path]", "PEM client private key for --tls-cert",
+        [&](const std::string &v) { opts.tls_key = v; opts.tls = true; }});
+    parser.add({"tls-server-name", 0, true, "[name]", "Name to verify in the server certificate when it differs from --host-ip",
+        [&](const std::string &v) { opts.tls_server_name = v; opts.tls = true; }});
 
     cli::Result result = parser.parse(argc, argv);
     if (result.status == cli::Status::Help) {
@@ -442,6 +461,10 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
     }
     if (!opts.sequence2.empty() && opts.sequence.empty()) {
         std::cerr << "--sequence2 requires --sequence." << std::endl;
+        exit(EX_USAGE);
+    }
+    if (opts.tls_cert.empty() != opts.tls_key.empty()) {
+        std::cerr << "--tls-cert and --tls-key must be given together." << std::endl;
         exit(EX_USAGE);
     }
 }
@@ -461,10 +484,29 @@ int main(int argc, char **argv) {
     // default 4MB message size. Just set it to the max
     grpc::ChannelArguments ch_args;
     ch_args.SetMaxReceiveMessageSize(INT_MAX);
+    std::shared_ptr<grpc::ChannelCredentials> credentials;
+    if (opts.tls) {
+        grpc::SslCredentialsOptions ssl_opts;
+        try {
+            if (!opts.tls_ca.empty()) ssl_opts.pem_root_certs = read_file(opts.tls_ca);
+            if (!opts.tls_cert.empty()) {
+                ssl_opts.pem_cert_chain = read_file(opts.tls_cert);
+                ssl_opts.pem_private_key = read_file(opts.tls_key);
+            }
+        }
+        catch (const std::exception &ex) {
+            std::cerr << "Cannot configure TLS: " << ex.what() << std::endl;
+            return EX_NOINPUT;
+        }
+        if (!opts.tls_server_name.empty()) {
+            ch_args.SetSslTargetNameOverride(opts.tls_server_name);
+        }
+        credentials = grpc::SslCredentials(ssl_opts);
+    } else {
+        credentials = grpc::InsecureChannelCredentials();
+    }
     std::shared_ptr<grpc::Channel> ch =
-        grpc::CreateCustomChannel(
-            server_address,
-            grpc::InsecureChannelCredentials(), ch_args);
+        grpc::CreateCustomChannel(server_address, credentials, ch_args);
     SequenceClient client(ch);
 
     if (opts.shutdown) {

@@ -59,6 +59,27 @@ The report file adds a header line before the standard kraken2 report
 columns.
 
 
+## Security
+
+By default the server listens without TLS and refuses remote shutdown
+requests. It is intended for a workstation or a trusted network. For anything
+else, enable TLS:
+
+```
+kraken2_server --db <db_path> --tls-cert server.crt --tls-key server.key
+kraken2_client --port 8080 --tls-ca server.crt --sequence reads.fq.gz
+```
+
+`--tls-ca` on the client names the CA bundle (or the self-signed server
+certificate) used to verify the server; `--tls` alone uses the system roots.
+`--tls-server-name` overrides the name checked in the certificate when it
+differs from `--host-ip`. Giving `--tls-ca` to the server as well turns on
+mutual TLS: clients must present a certificate signed by that CA with
+`--tls-cert` and `--tls-key`.
+
+`kraken2_client --shutdown` only works when the server was started with
+`--allow-remote-shutdown`. Otherwise stop the server with Ctrl-C or SIGTERM.
+
 ## Building from source
 
 The project can be built with `cmake` >3.13 and a C++17 compiler.
