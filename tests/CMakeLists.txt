@@ -19,7 +19,8 @@ target_link_libraries(unit_tests
     kraken2_proto
     classify
     ${_PROTOBUF_LIBPROTOBUF}
-    ${_GRPC_GRPCPP})
+    ${_GRPC_GRPCPP}
+    ${_ABSL_SYNC})
 
 add_test(NAME unit_tests COMMAND unit_tests)
 

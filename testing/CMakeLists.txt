@@ -5,6 +5,7 @@ target_link_libraries(raw_client
     kraken2_proto
     ${_PROTOBUF_LIBPROTOBUF}
     ${_REFLECTION}
-    ${_GRPC_GRPCPP})
+    ${_GRPC_GRPCPP}
+    ${_ABSL_SYNC})
 
 project_warnings(raw_client)

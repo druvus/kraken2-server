@@ -46,6 +46,15 @@ message(STATUS "Using gRPC ${gRPC_VERSION}")
 # Set a variable which points to a library installed on machine - gRPC for C++
 set(_GRPC_GRPCPP gRPC::grpc++)
 
+# gRPC headers use absl::Mutex inline, so every target that includes them
+# must link abseil directly; GNU ld does not pick it up transitively from
+# the shared gRPC library.
+if(TARGET absl::synchronization)
+    set(_ABSL_SYNC absl::synchronization)
+else()
+    set(_ABSL_SYNC "")
+endif()
+
 # Find and set a var for the exectuable for gRPC C++ plugin
 if(CMAKE_CROSSCOMPILING)
     find_program(_GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)

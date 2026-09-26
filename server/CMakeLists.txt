@@ -23,7 +23,8 @@ target_link_libraries(kraken2_server
     classify
     ${_PROTOBUF_LIBPROTOBUF}
     ${_REFLECTION}
-    ${_GRPC_GRPCPP})
+    ${_GRPC_GRPCPP}
+    ${_ABSL_SYNC})
 
 project_warnings(kraken2_server_core)
 project_warnings(kraken2_server)
