@@ -66,6 +66,13 @@ void Kraken2ServerClassifier::LoadIndex() {
                       << "is nucleotide; using nucleotide search." << std::endl;
         }
         opts.use_translated_search = !idx_opts.dna_db;
+        if (opts.use_translated_search) {
+            // kraken2 >= 2.1.3 initialises the codon lookup tables explicitly
+            // once at startup rather than lazily in TranslateToAllFrames.
+            // Without this call every codon translates to 'K'.
+            initLookUpTables();
+            std::cerr << "Protein database: using translated search." << std::endl;
+        }
 
         std::cerr << "Loading taxonomy..." << std::endl;
         taxonomy.reset(new Taxonomy(opts.taxonomy_filename, opts.use_memory_mapping));

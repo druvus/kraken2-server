@@ -140,6 +140,9 @@ synthetic taxonomy and no database.
 `kraken2` command line program (the same version as the submodule) on a small
 database, for single-end, paired-end, mismatched and empty input. It needs
 `kraken2` and `seqkit` on the `PATH` and built binaries in `build/`.
+When `kraken2-build` is available the script also builds a tiny synthetic
+protein database with `testing/make_protein_db.sh` and checks translated
+search against `kraken2` the same way.
 Configuring with `-DBUILD_TEST_TOOLS=ON` also builds `testing/raw_client`,
 which sends hand-built records and lets the script check how the server
 handles FASTQ records with a truncated quality string.

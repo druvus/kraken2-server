@@ -6,6 +6,7 @@ proto-build/
 
 testing/virus-zymo-kraken*
 testing/*.fastq*
+testing/tinyprot/
 
 .vscode/
 *.DS_Store

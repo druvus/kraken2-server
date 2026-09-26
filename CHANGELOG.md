@@ -51,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `str_representation` and `name` are marked deprecated but kept for
   compatibility.
 ### Fixed
+- Translated search against protein databases classified nothing after the
+  Kraken2 update, because kraken2 2.1.3 and later require an explicit call to
+  initialise the codon tables. The server now calls it when the database is
+  a protein database, and the parity test covers translated search with a
+  synthetic protein database built by `testing/make_protein_db.sh`.
 - A FASTQ record whose quality string length differs from its sequence, with
   `--min-quality` set, is reported as unclassified instead of terminating the
   server. Covered by `testing/parity_test.sh` using the `raw_client` test tool. The client now reports truncated or unreadable records and exits

@@ -9,7 +9,8 @@ add_executable(unit_tests
     test_thread_safe_queue.cc
     test_messages.cc
     test_cli.cc
-    test_worker_pool.cc)
+    test_worker_pool.cc
+    test_translate.cc)
 
 target_link_libraries(unit_tests
     doctest::doctest

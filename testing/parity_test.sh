@@ -107,6 +107,53 @@ wait $SERVER_PID
 check "server exit code" 0 $?
 trap - EXIT
 
+# Translated search against a tiny synthetic protein database, built on
+# first use by make_protein_db.sh (needs kraken2-build and python3).
+PROT_DB=tinyprot
+if command -v kraken2-build > /dev/null && ./make_protein_db.sh $PROT_DB > $WORK/protdb.log 2>&1; then
+    echo "+++ Translated search (protein database) +++"
+    kraken2 --db $PROT_DB --minimum-hit-groups 2 \
+        --report $WORK/ref_prot.report --output $WORK/ref_prot.out $PROT_DB/reads.fq > /dev/null 2>&1
+    check "reference kraken2 protein run" 0 $?
+    kraken2 --db $PROT_DB --minimum-hit-groups 2 --paired \
+        --report $WORK/ref_prot_p.report --output $WORK/ref_prot_p.out $PROT_DB/reads_1.fq $PROT_DB/reads_2.fq > /dev/null 2>&1
+    check "reference kraken2 protein paired run" 0 $?
+    # the synthetic reads all derive from the library, so kraken2 should classify them
+    check "reference classifies every synthetic protein read" 0 "$(awk '$1=="U"' $WORK/ref_prot.out | wc -l | tr -d ' ')"
+
+    "$SERVER" --db $PROT_DB --host-ip 127.0.0.1 --port $PORT > $WORK/server_prot.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 2
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $PROT_DB/reads.fq \
+        --report $WORK/prot.report > $WORK/prot.out 2> $WORK/prot.err
+    check "protein single-end client exit code" 0 $?
+    check "protein single-end output identical" 0 "$(diff $WORK/prot.out $WORK/ref_prot.out | grep -c '^[<>]')"
+    check "protein single-end report identical" 0 "$(diff <(tail -n +2 $WORK/prot.report) $WORK/ref_prot.report | grep -c '^[<>]')"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $PROT_DB/reads_1.fq --sequence2 $PROT_DB/reads_2.fq \
+        --report $WORK/prot_p.report > $WORK/prot_p.out 2> $WORK/prot_p.err
+    check "protein paired-end client exit code" 0 $?
+    check "protein paired-end output identical" 0 "$(diff $WORK/prot_p.out $WORK/ref_prot_p.out | grep -c '^[<>]')"
+    check "protein paired-end report identical" 0 "$(diff <(tail -n +2 $WORK/prot_p.report) $WORK/ref_prot_p.report | grep -c '^[<>]')"
+    check "server reports translated search" 1 "$(grep -c 'translated search' $WORK/server_prot.log)"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    check "protein server exit code" 0 $?
+    trap - EXIT
+
+    echo "+++ --translated-search with a nucleotide database +++"
+    "$SERVER" --db $DB --translated-search --host-ip 127.0.0.1 --port $PORT > $WORK/server_warn.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 3
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    trap - EXIT
+    check "warning when --translated-search given for nucleotide database" 1 "$(grep -c 'Warning: --translated-search' $WORK/server_warn.log)"
+else
+    echo "SKIP  translated search test (kraken2-build not available or protein database build failed)"
+fi
+
 # Server-side handling of records whose quality string length differs from
 # the sequence length. kseq rejects such records in the regular client, so
 # they are sent with the raw test client (built with -DBUILD_TEST_TOOLS=ON).
