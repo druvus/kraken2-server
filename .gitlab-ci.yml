@@ -14,6 +14,7 @@ variables:
 
 stages:
     - build
+    - test
     - prerelease
     - release
 
@@ -41,6 +42,31 @@ build-test:
             - build/client/kraken2_client
             - build/testing/raw_client
         expire_in: 1 week
+
+
+# Compare server and client output with the kraken2 program on the small
+# test database. The database and reads (about 300 MB) are cached between
+# runs. The binaries come from the build-test artifacts.
+parity-test:
+    stage: test
+    needs:
+        - build-test
+    script:
+        - apt-get update -qq && apt-get install -y -qq wget curl > /dev/null
+        - wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
+        - bash miniforge.sh -b -p /tmp/miniforge
+        - source /tmp/miniforge/bin/activate
+        - mamba create -y -q -n parity -c conda-forge -c bioconda libgrpc libprotobuf zlib kraken2 seqkit
+        - conda activate parity
+        - export SERVER=$PWD/build/server/kraken2_server
+        - export CLIENT=$PWD/build/client/kraken2_client
+        - export RAW_CLIENT=$PWD/build/testing/raw_client
+        - ./testing/parity_test.sh 8123
+    cache:
+        key: parity-test-data
+        paths:
+            - testing/virus-zymo-kraken2
+            - testing/virus-zymo-kraken.reads.fastq.gz
 
 
 deploy-checks:

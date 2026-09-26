@@ -29,8 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fast client cannot make the server hold its whole input in memory.
 - The conda recipe and CI use the conda-forge `libgrpc` and `libprotobuf`
   packages instead of building gRPC from source.
-- CI compiles and smoke tests the server and client on every push and runs
-  the unit tests.
+- CI compiles and smoke tests the server and client on every push, runs the
+  unit tests, and runs the kraken2 parity test with a cached test database.
+- Server and client share a table-driven option parser; each option is
+  declared once, usage text is generated, and error messages name the
+  option and accepted range.
 - Unit tests (doctest, `-DBUILD_TESTS=ON`) for the pure classification
   helpers, report writer, request conversion and queue. The helpers moved
   from the classifier class into `server/classify_core.cc`.
