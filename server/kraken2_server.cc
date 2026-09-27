@@ -1,5 +1,7 @@
-#include <getopt.h>
+#include <atomic>
 #include <csignal>
+#include <memory>
+#include <sysexits.h>
 
 #include <grpc/grpc.h>
 #include <grpc++/server.h>
@@ -7,7 +9,9 @@
 #include <grpc++/server_context.h>
 #include <grpc++/security/server_credentials.h>
 
+#include "cli.h"
 #include "messages.h"
+#include "utils.h"
 #include "classify_server.h"
 
 using grpc::ResourceQuota;
@@ -31,11 +35,25 @@ using kraken2proto::Kraken2Service;
 
 
 
+// Shared between the signal handler, the RemoteShutdown RPC and RunServer.
+// The promise may only be fulfilled once, so a flag guards against a second
+// signal or a shutdown request arriving after Ctrl-C.
+static std::promise<void> exit_promise;
+static std::atomic<bool> exit_flag{false};
+static std::promise<void> *exit_requested = &exit_promise;
+
+static void RequestExit() {
+    if (!exit_flag.exchange(true)) {
+        exit_requested->set_value();
+    }
+}
+
+
 class ServiceImpl final : public Kraken2Service::Service {
 
 public:
-    ServiceImpl(Options opts, Kraken2ServerClassifier *classifier, std::promise<void> *exit_requested)
-    : options(opts), classifier(classifier), exit_requested(exit_requested)
+    ServiceImpl(Options opts, Kraken2ServerClassifier *classifier)
+    : options(opts), classifier(classifier)
     {}
 
     /**
@@ -75,17 +93,18 @@ public:
     Status RemoteShutdown(
             ServerContext *context, const Kraken2ShutdownRequest *req,
             kraken2proto::Kraken2ShutdownResult *result) override {
-        std::cerr << "Received shutdown request." << std::endl;
-        try {
-            exit_requested->set_value();
-            result->set_successful(true);
-            std::cerr << "Shutdown request made." << std::endl;
-        }
-        catch (const std::exception &ex) {
+        if (!options.allow_remote_shutdown) {
+            std::cerr << "Refused a remote shutdown request; start with "
+                      << "--allow-remote-shutdown to permit it." << std::endl;
             result->set_successful(false);
-            std::cerr << "Failed to request shutdown"
-                      << ": " << ex.what() << std::endl;
+            return Status(StatusCode::PERMISSION_DENIED,
+                          "Remote shutdown is disabled on this server. "
+                          "Start it with --allow-remote-shutdown to permit it.");
         }
+        std::cerr << "Received shutdown request." << std::endl;
+        RequestExit();
+        result->set_successful(true);
+        std::cerr << "Shutdown request made." << std::endl;
         return Status::OK;
     }
 
@@ -116,7 +135,6 @@ public:
 private:
     Options options;
     Kraken2ServerClassifier *classifier;
-    std::promise<void> *exit_requested;
 
     grpc::Status IndexNotLoaded = grpc::Status(grpc::StatusCode::UNAVAILABLE, "Index not loaded yet, please wait.");
     grpc::Status IndexError = grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "There was an error loading the index, the server will remain unavailable without intervention.");
@@ -131,13 +149,9 @@ private:
 
 };
 
-// This is used in a lambda below and passed to std::signal, for which we
-// need a void(*)(int) 
-std::promise<void> *exit_requested;
-
 void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     std::string server_address = opts.host + ":" + std::to_string(opts.port);
-    ServiceImpl service(opts, classifier, exit_requested);
+    ServiceImpl service(opts, classifier);
     // Sets the max number of concurrent requests
     ResourceQuota rq;
     if (opts.max_queue > 0){
@@ -149,7 +163,36 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     // docs on unit of memory allocation - not recommended
     // rq.Resize(new_memory_allocation);
     ServerBuilder builder;
-    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+    std::shared_ptr<grpc::ServerCredentials> credentials;
+    if (!opts.tls_cert.empty() && !opts.tls_key.empty()) {
+        grpc::SslServerCredentialsOptions ssl_opts(
+            opts.tls_ca.empty()
+                ? GRPC_SSL_DONT_REQUEST_CLIENT_CERTIFICATE
+                : GRPC_SSL_REQUEST_AND_REQUIRE_CLIENT_CERTIFICATE_AND_VERIFY);
+        try {
+            grpc::SslServerCredentialsOptions::PemKeyCertPair pair;
+            pair.private_key = read_file(opts.tls_key);
+            pair.cert_chain = read_file(opts.tls_cert);
+            ssl_opts.pem_key_cert_pairs.push_back(pair);
+            if (!opts.tls_ca.empty()) {
+                ssl_opts.pem_root_certs = read_file(opts.tls_ca);
+            }
+        }
+        catch (const std::exception &ex) {
+            std::cerr << "Cannot configure TLS: " << ex.what() << std::endl;
+            return;
+        }
+        credentials = grpc::SslServerCredentials(ssl_opts);
+        std::cout << "TLS enabled"
+                  << (opts.tls_ca.empty() ? "." : " with client certificate verification.")
+                  << std::endl;
+    } else {
+        credentials = grpc::InsecureServerCredentials();
+        std::cout << "Warning: TLS is not enabled; connections are unencrypted and "
+                  << "unauthenticated. Use --tls-cert and --tls-key on untrusted networks."
+                  << std::endl;
+    }
+    builder.AddListeningPort(server_address, credentials);
     // don't use port if already in use
     builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
     builder.SetResourceQuota(rq);
@@ -167,8 +210,7 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
         std::cout << "Server listening on " << server_address
                   << ". Press Ctrl-C to end." << std::endl;
         // handle interrupts
-        auto handler = [](int s) { exit_requested->set_value(); };
-        // TODO: what's the actual behaviour here, i.e. what does Shutdown() do?
+        auto handler = [](int s) { RequestExit(); };
         std::signal(SIGINT, handler);
         std::signal(SIGTERM, handler);
         std::signal(SIGQUIT, handler);
@@ -181,162 +223,64 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
 }
 
 
-void Usage(int exit_code) {
-    std::cerr << "Usage: kraken2-server [options]" << std::endl
-              << std::endl
-              << "Options: (* mandatory)" << std::endl
-              << "\t-h, -H, -?, --help              Usage" << std::endl
-              << "*\t-d, -D, --db [path]            Path to Kraken 2 database" << std::endl
-              << "\t-r, -R, --max-requests [int]    Max number of requests from clients to process concurrently (0 for default)" << std::endl
-              << "\t-x, -X, --thread-pool [int]     Number of threads to use to classify reads from each client." << std::endl
-              << "\t-s, -S, --no-stats              Do not track statistics of all processed sequences on this server. Saves memory long-term." << std::endl
-              << "\t-i, -I  --host-ip               Server IP address (default: localhost)." << std::endl
-              << "\t-p, -P, --port [int]            Port number on which to listen for requests (0 - 65535, default 8080.)" << std::endl
-              << "\t-k, -K, --report-kmer           Include distinct k-mers in reports" << std::endl
-              << "\t-z, -Z, --report-zero           Include zero count taxons in reports" << std::endl
-              << "\t-t, -T, --translated-search     Use translated search when running classifications" << std::endl
-              << "\t-c, -C, --confidence [double]   Confidence score threshold (default: 0.0) (0 - 1)" << std::endl
-              << "\t-q, -Q, --min-quality [int]     Minimum base quality used in classification (default: 0), only effective with FASTQ input)." << std::endl
-              << "\t-g, -G, --hit-groups [int]      Minimum number of hit groups (overlapping k-mers sharing the same minimizer) needed to make a call (default: 2)" << std::endl
-              << "\t-o, -O, --memory-mapping        Avoids loading database into RAM" << std::endl;
-    exit(exit_code);
-}
-
-
 void ParseCommandLine(int argc, char **argv, Options &opts) {
-    // Define the long shell arguments
-    struct option long_options[] = {
-        {"db", required_argument, NULL, 'd'},
-        {"db", required_argument, NULL, 'D'},
-        {"max-requests", required_argument, NULL, 'r'},
-        {"max-requests", required_argument, NULL, 'R'},
-        {"thread-pool", required_argument, NULL, 'x'},
-        {"thread-pool", required_argument, NULL, 'X'},
-        {"no-stats", no_argument, NULL, 's'},
-        {"no-stats", no_argument, NULL, 'S'},
-        {"host-ip", required_argument, NULL, 'i'},
-        {"host-ip", required_argument, NULL, 'I'},
-        {"port", required_argument, NULL, 'p'},
-        {"port", required_argument, NULL, 'P'},
-        {"report-kmer", no_argument, NULL, 'k'},
-        {"report-kmer", no_argument, NULL, 'K'},
-        {"report-zero", no_argument, NULL, 'z'},
-        {"report-zero", no_argument, NULL, 'Z'},
-        {"translated-search", no_argument, NULL, 't'},
-        {"translated-search", no_argument, NULL, 'T'},
-        {"confidence", required_argument, NULL, 'c'},
-        {"confidence", required_argument, NULL, 'C'},
-        {"min-quality", required_argument, NULL, 'q'},
-        {"min-quality", required_argument, NULL, 'Q'},
-        {"hit-groups", required_argument, NULL, 'g'},
-        {"hit-groups", required_argument, NULL, 'G'},
-        {"memory-mapping", no_argument, NULL, 'o'},
-        {"memory-mapping", no_argument, NULL, 'O'},
-        {"wait", required_argument, NULL, 'w'},
-        {"wait", required_argument, NULL, 'W'},
-        {"help", no_argument, NULL, 'h'},
-        {"help", no_argument, NULL, 'H'},
-        {NULL, 0, NULL, 0}
-    };
-    int opt;
-    // Handle the various shell arguments (long mapped to short)
-    while ((opt = getopt_long(
-        argc, argv, "hH?d:D:r:R:sSkKzZc:C:q:Q:g:G:oOx:X:p:P:wW", long_options, NULL)) != -1) {
-        switch (opt){
-            case '?':
-            case 'h':
-            case 'H':
-                Usage(0);
-                break;
-            case 'd':
-            case 'D':
-                opts.db_path = optarg;
-                opts.taxonomy_filename = optarg + std::string("/taxo.k2d");
-                opts.options_filename = optarg + std::string("/opts.k2d");
-                opts.index_filename = optarg + std::string("/hash.k2d");
-                break;
-            case 'r':
-            case 'R':
-                opts.max_queue = atoi(optarg);
-                if (opts.max_queue < 0) {
-                    std::cerr << "Number of maximum concurrent requests cannot be less than 1 (0 for default)."
-                              << std::endl;
-                    exit(0);
-                }
-                break;
-            case 'x':
-            case 'X':
-                opts.thread_pool = atoi(optarg);
-                if (opts.thread_pool < 0) {
-                    std::cerr << "Number of maximum threads per client cannot be less than 1."
-                              << std::endl;
-                    exit(0);
-                }
-                break;
-            case 's':
-            case 'S':
-                opts.stats = false;
-                break;
-            case 'i':
-            case 'I':
-                opts.host = optarg;
-                break;
-            case 'p':
-            case 'P':
-                opts.port = atoi(optarg);
-                if (opts.port < 0 || opts.port > 65535) {
-                    std::cerr << "Port number not valid (0 - 65535)" << std::endl;
-                    exit(0);
-                }
-                break;
-            case 'k':
-            case 'K':
-                opts.report_kmer_data = true;
-                break;
-            case 'z':
-            case 'Z':
-                opts.report_zero_counts = true;
-                break;
-            case 't':
-            case 'T':
-                opts.use_translated_search = true;
-                break;
-            case 'c':
-            case 'C':
-                opts.confidence_threshold = atof(optarg);
-                if (opts.confidence_threshold < 0 || opts.confidence_threshold > 1) {
-                    std::cerr << "Confidence threshold is not valid (0 - 1)" << std::endl;
-                    exit(0);
-                }
-                break;
-            case 'q':
-            case 'Q':
-                opts.minimum_quality_score = atoi(optarg);
-                if (opts.minimum_quality_score < 0) {
-                    std::cerr << "Minimum quality score is not valid (> 0)" << std::endl;
-                    exit(0);
-                }
-                break;
-            case 'g':
-            case 'G':
-                opts.minimum_hit_groups = atoi(optarg);
-                if (opts.minimum_hit_groups < 0) {
-                    std::cerr << "Minimum hit groups is not valid (> 0)" << std::endl;
-                    exit(0);
-                }
-                break;
-            case 'o':
-            case 'O':
-                opts.use_memory_mapping = true;
-                break;
-            case 'w':
-            case 'W':
-                opts.wait = atoi(optarg);
-        }
+    using cli::Parser;
+    Parser parser("kraken2_server");
+    parser.add({"db", 'd', true, "[path]", "Path to a Kraken 2 database. May be repeated to classify against several databases at once (see docs/MULTI_DB.md)",
+        [&](const std::string &v) { opts.db_paths.push_back(v); }, true});
+    parser.add({"max-requests", 'r', true, "[int]", "Max number of client requests processed concurrently (0 for default)",
+        [&](const std::string &v) { opts.max_queue = Parser::ParseInt(v, "--max-requests", 0, 100000); }});
+    parser.add({"thread-pool", 'x', true, "[int]", "Classification threads shared by all clients (0, the default, uses all hardware threads)",
+        [&](const std::string &v) { opts.thread_pool = Parser::ParseInt(v, "--thread-pool", 0, 100000); }});
+    parser.add({"no-stats", 's', false, "", "Do not track statistics of all processed sequences on this server. Saves memory long-term.",
+        [&](const std::string &) { opts.stats = false; }});
+    parser.add({"host-ip", 'i', true, "[addr]", "Server IP address (default: localhost)",
+        [&](const std::string &v) { opts.host = v; }});
+    parser.add({"port", 'p', true, "[int]", "Port number on which to listen for requests (0 - 65535, default 8080)",
+        [&](const std::string &v) { opts.port = Parser::ParseInt(v, "--port", 0, 65535); }});
+    parser.add({"report-kmer", 'k', false, "", "Include distinct k-mers in reports",
+        [&](const std::string &) { opts.report_kmer_data = true; }});
+    parser.add({"report-zero", 'z', false, "", "Include zero count taxons in reports",
+        [&](const std::string &) { opts.report_zero_counts = true; }});
+    parser.add({"translated-search", 't', false, "", "Use translated search (set automatically for protein databases)",
+        [&](const std::string &) { opts.use_translated_search = true; }});
+    parser.add({"confidence", 'c', true, "[double]", "Confidence score threshold (default: 0.0) (0 - 1)",
+        [&](const std::string &v) { opts.confidence_threshold = Parser::ParseDouble(v, "--confidence", 0.0, 1.0); }});
+    parser.add({"min-quality", 'q', true, "[int]", "Minimum base quality used in classification (default: 0), FASTQ input only",
+        [&](const std::string &v) { opts.minimum_quality_score = Parser::ParseInt(v, "--min-quality", 0, 1000); }});
+    parser.add({"hit-groups", 'g', true, "[int]", "Minimum number of hit groups (overlapping k-mers sharing the same minimizer) needed to make a call (default: 2)",
+        [&](const std::string &v) { opts.minimum_hit_groups = Parser::ParseInt(v, "--hit-groups", 0, 1000000); }});
+    parser.add({"strict-merge", 0, false, "", "With several databases, apply --confidence and --hit-groups to the merged call (default: k2 behaviour, which does not)",
+        [&](const std::string &) { opts.strict_merge = true; }});
+    parser.add({"memory-mapping", 'o', false, "", "Avoids loading database into RAM",
+        [&](const std::string &) { opts.use_memory_mapping = true; }});
+    parser.add({"wait", 'w', true, "[int]", "Delay database loading by this many seconds (for testing)",
+        [&](const std::string &v) { opts.wait = Parser::ParseInt(v, "--wait", 0, 100000); }});
+    parser.add({"tls-cert", 0, true, "[path]", "PEM certificate chain; with --tls-key enables TLS",
+        [&](const std::string &v) { opts.tls_cert = v; }});
+    parser.add({"tls-key", 0, true, "[path]", "PEM private key for --tls-cert",
+        [&](const std::string &v) { opts.tls_key = v; }});
+    parser.add({"tls-ca", 0, true, "[path]", "PEM CA bundle; when given, clients must present a certificate signed by it",
+        [&](const std::string &v) { opts.tls_ca = v; }});
+    parser.add({"allow-remote-shutdown", 0, false, "", "Permit clients to stop the server with --shutdown (default: refused)",
+        [&](const std::string &) { opts.allow_remote_shutdown = true; }});
+
+    cli::Result result = parser.parse(argc, argv);
+    if (result.status == cli::Status::Help) {
+        std::cerr << parser.usage();
+        exit(0);
     }
-    if (opts.db_path.empty()) {
-        std::cerr << "You must specify the path to the Kraken 2 database." << std::endl;
-        Usage(0);
+    if (result.status == cli::Status::Error) {
+        std::cerr << result.message << std::endl << std::endl << parser.usage();
+        exit(EX_USAGE);
+    }
+    if (opts.tls_cert.empty() != opts.tls_key.empty()) {
+        std::cerr << "--tls-cert and --tls-key must be given together." << std::endl;
+        exit(EX_USAGE);
+    }
+    if (!opts.tls_ca.empty() && opts.tls_cert.empty()) {
+        std::cerr << "--tls-ca requires --tls-cert and --tls-key." << std::endl;
+        exit(EX_USAGE);
     }
 }
 
@@ -344,12 +288,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
 int main(int argc, char **argv) {
     Options opts;
     ParseCommandLine(argc, argv, opts);
-    Kraken2ServerClassifier *classifier = new Kraken2ServerClassifier(opts);
-    exit_requested = new std::promise<void>;
-    RunServer(opts, classifier);
+    std::unique_ptr<Kraken2ServerClassifier> classifier(new Kraken2ServerClassifier(opts));
+    RunServer(opts, classifier.get());
 
-    int rtn = classifier->index_available ? EX_OK : EX_IOERR;
-    delete classifier;
-    delete exit_requested;
-    return rtn;
+    return classifier->index_available ? EX_OK : EX_IOERR;
 }

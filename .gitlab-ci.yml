@@ -13,15 +13,66 @@ variables:
 
 
 stages:
+    - build
+    - test
     - prerelease
-    - build-deps
     - release
+
+
+# Compile and smoke test on every push, using the same conda-forge packages
+# as the conda recipe. Packaging jobs below run only on tags.
+build-test:
+    stage: build
+    script:
+        - apt-get update -qq && apt-get install -y -qq wget > /dev/null
+        - wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
+        - bash miniforge.sh -b -p /tmp/miniforge
+        - source /tmp/miniforge/bin/activate
+        - mamba create -y -q -n build -c conda-forge cmake libgrpc libprotobuf zlib cxx-compiler make doctest
+        - conda activate build
+        - mkdir build && cd build
+        - cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST_TOOLS=ON -DBUILD_TESTS=ON -DENABLE_WERROR=ON ..
+        - make -j 4
+        - ./tests/unit_tests
+        - ./server/kraken2_server --help
+        - ./client/kraken2_client --help
+    artifacts:
+        paths:
+            - build/server/kraken2_server
+            - build/client/kraken2_client
+            - build/testing/raw_client
+        expire_in: 1 week
+
+
+# Compare server and client output with the kraken2 program on the small
+# test database. The database and reads (about 300 MB) are cached between
+# runs. The binaries come from the build-test artifacts.
+parity-test:
+    stage: test
+    needs:
+        - build-test
+    script:
+        - apt-get update -qq && apt-get install -y -qq wget curl > /dev/null
+        - wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
+        - bash miniforge.sh -b -p /tmp/miniforge
+        - source /tmp/miniforge/bin/activate
+        - mamba create -y -q -n parity -c conda-forge -c bioconda libgrpc libprotobuf zlib kraken2 seqkit
+        - conda activate parity
+        - export SERVER=$PWD/build/server/kraken2_server
+        - export CLIENT=$PWD/build/client/kraken2_client
+        - export RAW_CLIENT=$PWD/build/testing/raw_client
+        - ./testing/parity_test.sh 8123
+    cache:
+        key: parity-test-data
+        paths:
+            - testing/virus-zymo-kraken2
+            - testing/virus-zymo-kraken.reads.fastq.gz
 
 
 deploy-checks:
     stage: prerelease
     variables:
-        PACKAGE_NAME: modbampy
+        PACKAGE_NAME: kraken2-server
     script:
         # TODO: store a version in code somewhere and check
         - !reference [.check, changelog]
@@ -30,61 +81,8 @@ deploy-checks:
         - if: '$CI_COMMIT_TAG =~ /^v[[:digit:]]+\.[[:digit:]]+\.[[:digit:]]+$/'
 
 
-# making gRPC can take an age. I (cjw) couldn't get cmake to work nicely
-# with gRPC library package from conda. So instead we'll build once in conda
-# and cache the result for future builds. Note if conda compiler ever changes
-# this build may need to be refreshed.
-.make-grpc:
-    stage: build-deps
-    script:
-        - ls
-        - if [ -d proto-build ]; then echo "SKIPPING gRPC build"; exit 0; fi
-        - echo "SETTING UP CONDA"
-        - condasetup="Mambaforge-${MINICONDAOS}-${ARCH}.sh"
-        - wget https://github.com/conda-forge/miniforge/releases/latest/download/${condasetup}
-        - ourconda=/tmp/miniconda-grpcbuild
-        - bash ${condasetup} -b -p ${ourconda}
-        - rm ${condasetup}
-        - source ${ourconda}/bin/activate
-        - conda init
-        - mamba install -y git cxx-compiler make cmake
-        - echo "BUILDING gRPC UNDER CONDA for ${MINICONDAOS}-${ARCH}"
-        - export LDFLAGS="-lrt"
-        - export PROTO_DIR=$PWD/proto-build
-        - mkdir -p $PROTO_DIR
-        - git clone --recurse-submodules -b v1.46.3 --depth 1 --shallow-submodules https://github.com/grpc/grpc
-        - mkdir -p grpc/cmake/build
-        - pushd grpc/cmake/build
-        - cmake -DgRPC_INSTALL=ON -DgRPC_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$PROTO_DIR ../..
-        - make -j 8
-        - make install
-        - popd
-    cache:
-        key: "$MINICONDAOS-$ARCH"
-        paths:
-            - proto-build
-    artifacts:
-        paths:
-            - proto-build 
-
-
-make-grpc-x86:
-    extends: .make-grpc
-    variables:
-        MINICONDAOS: Linux
-        ARCH: x86_64
-    tags: # just for cache
-        - grid
-        - docker
-
-make-grpc-arm64:
-    extends: .make-grpc
-    variables:
-        MINICONDAOS: Linux
-        ARCH: aarch64
-    tags: # TODO: use a single runner to hit the cache
-        - arm64
-
+# gRPC and protobuf are taken from the conda-forge libgrpc and libprotobuf
+# packages (see conda/meta.yaml), so no separate dependency build is needed.
 .conda:
     variables:
         RECIPEPATH: "../conda"
@@ -107,8 +105,6 @@ conda-linux-x86:
     variables:
         MINICONDAOS: Linux
         ARCH: x86_64
-    needs:
-        - make-grpc-x86
 
 conda-linux-arm64:
     extends:
@@ -119,15 +115,8 @@ conda-linux-arm64:
         ARCH: aarch64
     tags:
         - arm64
-    needs:
-        - make-grpc-arm64
 
-#conda-mac:
-#    extends:
-#        - .deploy-conda-mac
-#        - .conda
-#
-#conda-mac-arm:
-#    extends:
-#        - .deploy-conda-mac-arm
-#        - .conda
+conda-mac-arm:
+    extends:
+        - .deploy-conda-mac-arm
+        - .conda

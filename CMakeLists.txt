@@ -9,8 +9,20 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_compile_options(-Wall)
 add_definitions(-DLINEAR_PROBING)
+
+# Treat warnings as errors in this project's own sources (not the kraken2
+# submodule). Enabled in CI.
+option(ENABLE_WERROR "Treat warnings as errors in project sources" OFF)
+function(project_warnings target)
+    if(ENABLE_WERROR)
+        target_compile_options(${target} PRIVATE -Werror)
+    endif()
+endfunction()
 set(CMAKE_CXX_FLAGS_DEBUG "-g")
-set(CMAKE_CXX_FLAGS_RELEASE "-O3")
+# Keep -DNDEBUG: the abseil headers pulled in by gRPC only reference
+# out-of-line debug symbols (absl::Mutex::Dtor) without it, and the
+# conda-forge abseil libraries are release builds that do not export them.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # Locate and verify version of protobuf
 set(protobuf_MODULE_COMPATIBLE TRUE)
@@ -36,6 +48,18 @@ message(STATUS "Using gRPC ${gRPC_VERSION}")
 
 # Set a variable which points to a library installed on machine - gRPC for C++
 set(_GRPC_GRPCPP gRPC::grpc++)
+
+# gRPC headers use absl::Mutex inline, so every target that includes them
+# must link abseil directly; GNU ld does not pick it up transitively from
+# the shared gRPC library.
+find_package(absl CONFIG QUIET)
+if(TARGET absl::synchronization)
+    set(_ABSL_SYNC absl::synchronization)
+    message(STATUS "Linking abseil synchronization explicitly")
+else()
+    set(_ABSL_SYNC "")
+    message(STATUS "abseil targets not found; relying on gRPC's link interface")
+endif()
 
 # Find and set a var for the exectuable for gRPC C++ plugin
 if(CMAKE_CROSSCOMPILING)
@@ -63,6 +87,7 @@ add_library(classify
     kraken2/src/seqreader.cc
     kraken2/src/aa_translate.cc
     kraken2/src/utilities.cc
+    kraken2/src/reports.cc
     kraken2/src/hyperloglogplus.cc)
 
 # Specify the headers (include) for this lib (target) and declare them PUBLIC so are findable by other libs/executables
@@ -73,3 +98,14 @@ add_subdirectory(protos)
 add_subdirectory(utils)
 add_subdirectory(server)
 add_subdirectory(client)
+
+option(BUILD_TEST_TOOLS "Build test tools in testing/" OFF)
+if(BUILD_TEST_TOOLS)
+    add_subdirectory(testing)
+endif()
+
+option(BUILD_TESTS "Build unit tests (requires doctest)" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()

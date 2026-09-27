@@ -1,9 +1,9 @@
-# Create executable for the server
+# Create executable for the client
 add_executable(kraken2_client
     kraken2_client.cc kseq.cc)
 find_package(ZLIB)
 
-target_include_directories(kraken2_server PUBLIC .)
+target_include_directories(kraken2_client PUBLIC .)
 
 # Add dependencies / links for this executable
 target_link_libraries(kraken2_client
@@ -13,4 +13,7 @@ target_link_libraries(kraken2_client
     classify
     ${_PROTOBUF_LIBPROTOBUF}
     ${_REFLECTION}
-    ${_GRPC_GRPCPP})
+    ${_GRPC_GRPCPP}
+    ${_ABSL_SYNC})
+
+project_warnings(kraken2_client)
