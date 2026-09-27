@@ -47,7 +47,7 @@ kraken2_client --port $port --host-ip 127.0.0.1
 
 echo ""
 echo " +++ Starting server +++"
-kraken2_server --db $db --host-ip 127.0.0.1 --port $port --wait 2 --thread-pool ${threads} &
+kraken2_server --allow-remote-shutdown --db $db --host-ip 127.0.0.1 --port $port --wait 2 --thread-pool ${threads} &
 sleep 5  # give database time to load
 
 echo ""

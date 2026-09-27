@@ -1,47 +1,54 @@
 # Kraken2 Server
 
-Kraken2 is a taxonomic sequence classification system. This project builds
-on the classification functionality to provide a server-client architecture
-to allow two use cases:
+Kraken2 is a taxonomic sequence classification system. This project wraps
+its classifier in a gRPC server so that a database is loaded once into a
+persistent process and reads can be classified as they arrive, from the
+same machine or from clients elsewhere. Two uses follow:
 
-* Access to the classification algorithms in low-resource settings by
-  sending requests to remote, more powerful servers
-* One-time loading of databases (a slow step compared to classification)
-  into a persistent process, with subsequent independent classification
-  requests as data becomes available
+* Access to classification from low-resource machines, for example a
+  sequencing laptop, by sending reads to a more powerful server.
+* One-time loading of a database, a slow step compared to classification,
+  with independent classification requests as data becomes available.
 
-The software is currently a public beta release.
+The server compiles the Kraken 2.17.2 sources (a git submodule) and
+produces per-read output and reports identical to the `kraken2` program on
+the test databases used in `testing/parity_test.sh`, for nucleotide and
+protein databases, single-end and paired-end reads, and several databases
+at once.
 
 ## Installation
 
-The kraken2 server and client are available through our conda channel:
+The server and client are available through the nanoporetech conda channel:
 
 ```
 mamba create -n kraken2 -c conda-forge -c nanoporetech kraken2-server
 ```
 
+The Python client is installed from a checkout, see "Python client".
+
 ## Usage
 
-To start a server run:
+Start a server:
 
 ```
 kraken2_server --db <db_path>
 ```
 
-where `<db_path>` is a directory containing a standard kraken2 database. The
-server will wait for requests for clients and respond as necessary.
+where `<db_path>` is a directory containing a standard kraken2 database
+(`hash.k2d`, `opts.k2d`, `taxo.k2d`). The server starts listening at once
+and loads the database in the background; clients wait until it is ready.
+Classification uses all hardware threads unless `--thread-pool` says
+otherwise.
 
-To classify reads run a client with:
+Classify reads with the client:
 
 ```
-kraken2_client --port 8080 --sequence <reads.fq.gz>
+kraken2_client --port 8080 --sequence <reads.fq.gz> --report <report.txt> > classifications.txt
 ```
 
-where `<reads.fq.gz>` can be FASTQ or FASTA either plain text or gzip compressed.
-Use `--sequence -` to read from standard input.
-
-Paired-end reads are classified as one fragment per pair, as with
-`kraken2 --paired`, by giving the mate file as a second input:
+`<reads.fq.gz>` can be FASTQ or FASTA, plain or gzip compressed; `-` reads
+standard input. Paired-end reads are classified as one fragment per pair,
+as with `kraken2 --paired`, by giving the mate file as a second input:
 
 ```
 kraken2_client --port 8080 --sequence <reads_1.fq.gz> --sequence2 <reads_2.fq.gz>
@@ -49,15 +56,78 @@ kraken2_client --port 8080 --sequence <reads_1.fq.gz> --sequence2 <reads_2.fq.gz
 
 The two files must list mates in the same order. If they contain different
 numbers of reads, only complete pairs are classified and the client exits
-with a non-zero status. Pairing is decided per read, so a single server can
-serve single-end and paired-end clients at the same time.
+with status 65. Pairing is decided per read, so one server serves
+single-end and paired-end clients at the same time.
 
-The per-read output has the same columns as the standard `kraken2` output
-(classified flag, read id, taxonomy id, sequence length or `len1|len2` for
-pairs, and the minimizer hit list), in the same order as the input reads.
-The report file adds a header line before the standard kraken2 report
-columns.
+Without `--sequence` the client prints the server's cumulative report over
+every read it has classified since it started (unless the server runs with
+`--no-stats`).
 
+### Output
+
+Per-read lines on standard output have the columns of `kraken2` output:
+
+```
+C  read_id  562  1683        562:13 0:4 A:2 562:9
+C  frag1    1639 761|509     0:727 |:| 0:33 1639:16
+```
+
+classified flag, read id (with `/1` and `/2` stripped for pairs), taxonomy
+id, sequence length (`len1|len2` for pairs), and the minimizer hit list with
+`A` for ambiguous spans, `|:|` between mates and `-:-` between reading
+frames. Results arrive in the order the reads were sent, whatever the
+number of server threads.
+
+The report written with `--report` is a kraken2 report with one header line
+added before the standard columns. `--report-kmer` on the server adds the
+k-mer and distinct k-mer columns.
+
+### Server options
+
+| option | meaning |
+|---|---|
+| `-d, --db PATH` | database directory; repeat for several databases |
+| `-x, --thread-pool N` | classification threads shared by all clients (default: all hardware threads) |
+| `-r, --max-requests N` | gRPC threads, bounds concurrent client requests (0: gRPC default) |
+| `-i, --host-ip ADDR`, `-p, --port N` | listen address and port (default localhost:8080) |
+| `-c, --confidence X` | confidence threshold 0 to 1 (default 0) |
+| `-g, --hit-groups N` | minimum distinct minimizer hits for a call (default 2) |
+| `-q, --min-quality N` | mask bases below this FASTQ quality (default 0, off) |
+| `-k, --report-kmer`, `-z, --report-zero` | report k-mer columns, include zero-count taxa |
+| `-o, --memory-mapping` | map the database instead of reading it into RAM |
+| `-s, --no-stats` | do not keep the server-wide summary |
+| `--strict-merge` | with several databases, apply `--confidence` and `--hit-groups` to the merged call |
+| `--tls-cert`, `--tls-key`, `--tls-ca` | TLS, see "Security" |
+| `--allow-remote-shutdown` | permit `kraken2_client --shutdown` |
+| `-w, --wait N` | delay database loading N seconds (testing) |
+
+Short options are accepted in either case (`-d` or `-D`). `--translated-search`
+is accepted for compatibility; protein databases are detected from `opts.k2d`.
+
+### Client options
+
+| option | meaning |
+|---|---|
+| `-s, --sequence PATH` | reads, FASTA or FASTQ, plain or gzipped, `-` for stdin; omit to print the server summary |
+| `-2, --sequence2 PATH` | mate file for paired-end reads |
+| `-r, --report PATH` | write the kraken2 style report here |
+| `-i, --host-ip ADDR`, `-p, --port N` | server address (default localhost:8080) |
+| `-k, --shutdown` | ask the server to stop (needs `--allow-remote-shutdown` on the server) |
+| `-t, --tls`, `--tls-ca`, `--tls-cert`, `--tls-key`, `--tls-server-name` | TLS, see "Security" |
+
+Exit status is 0 on success, 64 for a usage error, 65 for mismatched
+paired-end inputs, 69 when the server cannot be reached, 74 when an input
+file cannot be read or parsed, or the gRPC status code of a failed request.
+A client started while the server is still loading its database waits.
+
+### Memory and threads
+
+The hash table is read into RAM by default. `--memory-mapping` maps the
+files instead, so the operating system page cache is shared with other
+processes using the same database (for example the `kraken2` program) and
+a large database starts serving before it is fully paged in. Each stream
+buffers at most twice the thread count in request batches, so a fast
+client cannot make the server hold its whole input in memory.
 
 ## Several databases
 
@@ -77,10 +147,11 @@ parent of every shared taxid. Memory use is the sum of the databases. With
 several databases the merged call is made with confidence 0 and without the
 hit-group filter, as kraken2's merge program does; `--confidence` and
 `--hit-groups` therefore have no effect on the merged call and the output is
-identical to `k2` on the test databases (`testing/parity_test.sh`). Add
-`--strict-merge` to apply both thresholds to the merged call instead; the
-result is then filtered the way a single-database run would be, and can
-differ from `k2`. See `docs/MULTI_DB.md`.
+identical to `k2` on the test databases. Add `--strict-merge` to apply both
+thresholds to the merged call instead; the result is then filtered the way
+a single-database run would be, and can differ from `k2`. Unlike `k2`, the
+server needs only the `.k2d` files, not `nodes.dmp` or `seqid2taxid.map`.
+See `docs/MULTI_DB.md`.
 
 ## Python client
 
@@ -99,7 +170,8 @@ with Client("localhost", 8080) as client:
         print(hit.read_id, hit.tax_id)
 ```
 
-See `python/README.md` for details.
+`classify()` takes any iterable of records, so reads can be streamed from a
+running sequencer. See `python/README.md`.
 
 ## Security
 
@@ -124,11 +196,11 @@ mutual TLS: clients must present a certificate signed by that CA with
 
 ## Building from source
 
-The project can be built with `cmake` >3.13 and a C++17 compiler.
+The project needs `cmake` >= 3.13 and a C++17 compiler.
 
-The Kraken2 sources are included as a git submodule (`kraken2/`, pinned to
-upstream commit `01fb1d9`, Kraken 2.17.2) and are compiled into the server.
-Clone with submodules, or fetch them afterwards:
+The Kraken2 sources are a git submodule (`kraken2/`, pinned to upstream
+commit `01fb1d9`, Kraken 2.17.2) compiled into the server. Clone with
+submodules, or fetch them afterwards:
 
 ```
 git clone --recurse-submodules https://github.com/epi2me-labs/kraken2-server.git
@@ -137,8 +209,7 @@ cd kraken2-server
 git submodule update --init
 ```
 
-The server-client architecture uses gRPC and protobuf to communicate. The
-recommended way to obtain them is the conda-forge `libgrpc` and `libprotobuf`
+gRPC and protobuf come from the conda-forge `libgrpc` and `libprotobuf`
 packages, which is also what the conda recipe in `conda/` and the CI use:
 
 ```
@@ -149,16 +220,15 @@ cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release ..
 make -j 8
 ```
 
-The server and client executables are written to:
-
-```
-build/server/kraken2_server
-build/client/kraken2_client
-```
+The executables are `build/server/kraken2_server` and
+`build/client/kraken2_client`. Useful CMake options: `-DBUILD_TESTS=ON`
+(unit tests, needs the `doctest` package), `-DBUILD_TEST_TOOLS=ON`
+(`testing/raw_client`), `-DENABLE_WERROR=ON` (warnings are errors in the
+project's own sources; on in CI). `conda build conda/` produces the conda
+package.
 
 Note that the older `grpc-cpp` conda package pins a protobuf without CMake
-configuration files and does not work here. `conda build conda/` produces
-the package that the conda channel distributes.
+configuration files and does not work here.
 
 ### Fallback: building gRPC from source
 
@@ -192,31 +262,63 @@ make -j 8
 
 ## Testing
 
-Unit tests use [doctest](https://github.com/doctest/doctest) (conda-forge
-package `doctest`). Configure with `-DBUILD_TESTS=ON` and run
-`build/tests/unit_tests` or `ctest`. They cover the pure classification
-helpers (taxon resolution, hit list formatting, pair name trimming), the
-report writer, the request conversion and the blocking queue, using a small
-synthetic taxonomy and no database.
+Unit tests use [doctest](https://github.com/doctest/doctest). Configure with
+`-DBUILD_TESTS=ON` and run `build/tests/unit_tests` or `ctest`. They cover
+the classification helpers, the merged taxonomy, the report writer, request
+conversion, the option parser, the queue and worker pool, and the
+translation tables, using a small synthetic taxonomy and no database.
 
-`testing/parity_test.sh` compares the server and client output with the
-`kraken2` command line program (the same version as the submodule) on a small
-database, for single-end, paired-end, mismatched and empty input. It needs
-`kraken2` and `seqkit` on the `PATH` and built binaries in `build/`.
-When `kraken2-build` is available the script also builds a tiny synthetic
-protein database with `testing/make_protein_db.sh` and checks translated
-search against `kraken2` the same way.
-Configuring with `-DBUILD_TEST_TOOLS=ON` also builds `testing/raw_client`,
-which sends hand-built records and lets the script check how the server
-handles FASTQ records with a truncated quality string.
+`testing/parity_test.sh` is the acceptance test. It compares server and
+client output with the `kraken2` and `k2` programs from the same Kraken2
+version on small databases:
+
+* the virus-zymo nucleotide test database (downloaded on first use):
+  single-end, paired-end, mismatched pairs, empty input, output order;
+* a synthetic protein database built by `testing/make_protein_db.sh`:
+  translated search, single-end and paired-end;
+* two synthetic nucleotide databases sharing a species, built by
+  `testing/make_multidb.sh`: multi-database classification against
+  `k2 classify --db a,b`, and `--strict-merge`;
+* malformed quality strings sent with `testing/raw_client`, TLS, mutual TLS,
+  the refused remote shutdown, and clean exit on SIGTERM.
+
+It needs `kraken2`, `kraken2-build`, `k2`, `seqkit`, `openssl` and `python3`
+on the `PATH`; sections whose tools are missing are skipped with a notice.
+`python/tests` checks the Python client against the C++ client with pytest.
+
+Both CI configurations (`.github/workflows/build.yml` for the GitHub
+mirror, `.gitlab-ci.yml` for the ONT GitLab) build with warnings as errors,
+run the unit tests and the parity script on every push, and package on
+tags.
+
+## Relationship to upstream Kraken2
+
+Most of the classifier is compiled unchanged from the submodule. Four
+functions are adapted copies of upstream `classify.cc` and are marked as
+such in comments: `ClassifySequence` and `MaskLowQualityBases` in
+`server/classify_server.cc`, and `ResolveTree` and `AddHitlistString` in
+`server/classify_core.cc`. When the submodule is moved to a new upstream
+commit, diff those functions against upstream, rebuild, and run
+`testing/parity_test.sh` with a `kraken2` of the same version; the script
+is the definition of "still compatible".
 
 ## Benchmarks
 
-Benchmarking script from `testing/run_server.sh`
+Server throughput on 73,700 nanopore reads (198 Mbp, the virus-zymo test
+reads repeated twenty times) with one client on the same machine, v0.2.0,
+MacBook Pro M-series:
 
-**Single client test**
+| server threads | server time / s | throughput / Gbp per min |
+|---|---|---|
+| 1 | 10.2 | 1.2 |
+| 4 | 3.2 | 3.7 |
+| 8 | 2.1 | 5.7 |
 
-*MacBook Pro 14-inch 2021, M1 Max, 64Gb. macOS 13.2.1. Clang 13.1.6. 1190.33 Mbp per client*
+Earlier measurements with `testing/run_server.sh` on v0.1.x, kept for
+reference:
+
+**Single client** (MacBook Pro 14-inch 2021, M1 Max, 64Gb. macOS 13.2.1.
+Clang 13.1.6. 1190.33 Mbp per client)
 
 | clients | server threads | client time / s | server throughput / Mbp/m |
 |---------|----------------|-----------------|---------------------------|
@@ -225,9 +327,8 @@ Benchmarking script from `testing/run_server.sh`
 |       1 |              6 |            18.4 |                      3876 |
 |       1 |              8 |            16.8 |                      4237 |
 
-**Multi client test**
-
-*Intel Xeon Gold 6230, Ubuntu 16.04.7, gcc 11.3.0. 991.94 Mbp per client*
+**Multiple clients** (Intel Xeon Gold 6230, Ubuntu 16.04.7, gcc 11.3.0.
+991.94 Mbp per client)
 
 | clients | server threads | client time / s | server throughput / Mbp/m |
 |---------|----------------|-----------------|---------------------------|
@@ -236,4 +337,3 @@ Benchmarking script from `testing/run_server.sh`
 |       4 |             64 |            24.1 |                      9802 |
 |       8 |             64 |            28.9 |                     16335 |
 |      16 |             64 |            62.2 |                     14958 |
-
