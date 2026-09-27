@@ -151,10 +151,14 @@ void Kraken2ServerClassifier::LoadIndex() {
                 idx.to_merged = kraken2server::MapToMerged(*idx.taxonomy, *taxonomy);
             std::cerr << "Merged taxonomy has " << taxonomy->node_count() - 1
                       << " taxa." << std::endl;
-            if (opts.confidence_threshold > 0 || opts.minimum_hit_groups != 2) {
+            if (opts.strict_merge) {
+                std::cerr << "Strict merge: --confidence and --hit-groups apply to the "
+                          << "merged call (output may differ from k2)." << std::endl;
+            } else if (opts.confidence_threshold > 0 || opts.minimum_hit_groups != 2) {
                 std::cerr << "Note: with several databases the merged call follows "
                           << "kraken2's merge program: --confidence and --hit-groups "
-                          << "are not applied to it (see docs/MULTI_DB.md)." << std::endl;
+                          << "are not applied to it. Use --strict-merge to apply them "
+                          << "(see docs/MULTI_DB.md)." << std::endl;
             }
         }
     }
@@ -514,7 +518,7 @@ Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
         total_kmers--;
     if (opts.use_translated_search) // account for reading frame markers
         total_kmers -= paired ? 4 : 2;
-    if (multi_db)
+    if (multi_db && !opts.strict_merge)
     {
         // kraken2's merge program recomputes the call from the merged hit
         // lists with confidence 0 and no hit-group filter (docs/MULTI_DB.md).

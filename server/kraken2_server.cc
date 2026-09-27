@@ -250,6 +250,8 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         [&](const std::string &v) { opts.minimum_quality_score = Parser::ParseInt(v, "--min-quality", 0, 1000); }});
     parser.add({"hit-groups", 'g', true, "[int]", "Minimum number of hit groups (overlapping k-mers sharing the same minimizer) needed to make a call (default: 2)",
         [&](const std::string &v) { opts.minimum_hit_groups = Parser::ParseInt(v, "--hit-groups", 0, 1000000); }});
+    parser.add({"strict-merge", 0, false, "", "With several databases, apply --confidence and --hit-groups to the merged call (default: k2 behaviour, which does not)",
+        [&](const std::string &) { opts.strict_merge = true; }});
     parser.add({"memory-mapping", 'o', false, "", "Avoids loading database into RAM",
         [&](const std::string &) { opts.use_memory_mapping = true; }});
     parser.add({"wait", 'w', true, "[int]", "Delay database loading by this many seconds (for testing)",

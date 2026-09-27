@@ -63,6 +63,10 @@ struct Options {
     int minimum_hit_groups = 2;
     bool use_memory_mapping = false;
     int wait = 0;
+    // With several databases, apply --confidence and --hit-groups to the
+    // merged call. Off by default to match k2 classify --db a,b, whose
+    // merge program uses confidence 0 and no hit-group filter.
+    bool strict_merge = false;
 
     // Transport security. TLS is enabled when both tls_cert and tls_key are
     // given; tls_ca additionally requires and verifies client certificates.

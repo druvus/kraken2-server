@@ -123,12 +123,14 @@ built from the input `taxo.k2d` taxonomies themselves:
   client cannot tell how many databases a server holds. `GetSummary`
   reports over the merged taxonomy.
 - `--confidence` and `--hit-groups` given with several databases print a
-  warning that they apply per database in `k2` but have no effect on the
-  merged call here, since the server does not compute per-database calls.
-  If that turns out to be wanted, per-database `ResolveTree` calls can be
-  added and the merged call gated on "at least one database classified",
-  which is how `k2` users likely read the documentation; that would diverge
-  from `merge`.
+  note that they apply per database in `k2` but have no effect on the
+  merged call, since `merge` discards the per-database calls and the server
+  does not compute them.
+- `--strict-merge` applies both thresholds to the merged call: the user's
+  confidence in `ResolveTree` and the minimum hit-group count over merged
+  minimizers. This filters the way a single-database run does and can
+  differ from `k2`. It is off by default so that output stays comparable
+  to `k2 classify --db a,b`.
 - Memory: hash tables are additive; `--memory-mapping` applies to all.
 
 ## Verification

@@ -76,8 +76,11 @@ must all be nucleotide or all protein. Their taxonomies must agree on the
 parent of every shared taxid. Memory use is the sum of the databases. With
 several databases the merged call is made with confidence 0 and without the
 hit-group filter, as kraken2's merge program does; `--confidence` and
-`--hit-groups` therefore have no effect. Output is identical to `k2` on the
-test databases (`testing/parity_test.sh`). See `docs/MULTI_DB.md`.
+`--hit-groups` therefore have no effect on the merged call and the output is
+identical to `k2` on the test databases (`testing/parity_test.sh`). Add
+`--strict-merge` to apply both thresholds to the merged call instead; the
+result is then filtered the way a single-database run would be, and can
+differ from `k2`. See `docs/MULTI_DB.md`.
 
 ## Python client
 

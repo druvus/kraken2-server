@@ -186,6 +186,30 @@ if command -v kraken2-build > /dev/null && command -v k2 > /dev/null && ./make_m
     check "multi-database server exit code" 0 $?
     trap - EXIT
 
+    # --strict-merge applies the hit-group filter to the merged call: with an
+    # impossible threshold every read is unclassified, whereas the default
+    # (k2 behaviour) ignores the threshold and still matches k2.
+    "$SERVER" --allow-remote-shutdown --db $MULTI/dbA --db $MULTI/dbB --hit-groups 100000 --host-ip 127.0.0.1 --port $PORT > $WORK/server_multi_hg.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 2
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $MULTI/reads.fq > $WORK/multi_hg.out 2> /dev/null
+    check "default merge ignores --hit-groups like k2" 0 "$(diff $WORK/multi_hg.out $WORK/ref_multi.out | grep -c '^[<>]')"
+    check "server notes that the thresholds are not applied" 1 "$(grep -c 'Use --strict-merge' $WORK/server_multi_hg.log)"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    trap - EXIT
+    "$SERVER" --allow-remote-shutdown --db $MULTI/dbA --db $MULTI/dbB --hit-groups 100000 --strict-merge --host-ip 127.0.0.1 --port $PORT > $WORK/server_multi_strict.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    sleep 2
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $MULTI/reads.fq > $WORK/multi_strict.out 2> /dev/null
+    check "--strict-merge applies --hit-groups to the merged call" 120 "$(awk '$1=="U"' $WORK/multi_strict.out | wc -l | tr -d ' ')"
+    check "--strict-merge keeps hit lists" 0 "$(diff <(cut -f2,5 $WORK/multi_strict.out) <(cut -f2,5 $WORK/ref_multi.out) | grep -c '^[<>]')"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    trap - EXIT
+
     # a single database must give the same output as before the merge code
     "$SERVER" --allow-remote-shutdown --db $MULTI/dbA --host-ip 127.0.0.1 --port $PORT > $WORK/server_dbA.log 2>&1 &
     SERVER_PID=$!
