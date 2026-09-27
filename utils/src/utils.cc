@@ -1,3 +1,4 @@
+#include <fstream>
 #include <sstream>
 #include <stdexcept>
 #include <cassert>
@@ -20,6 +21,17 @@ std::string extract_basename(const std::string& path)
     std::string result(basename(temp_s));
     free(temp_s);
     return result;
+}
+
+std::string read_file(const std::string& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        throw std::runtime_error("Cannot read file: " + path);
+    }
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
 }
 
 void raise_from_system_error_code(const std::string& user_message, int err)

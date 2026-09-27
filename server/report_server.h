@@ -1,7 +1,8 @@
-#ifndef KRAKEN2_REPORTS_H_
-#define KRAKEN2_REPORTS_H_
+#ifndef KRAKEN2_SERVER_REPORTS_H_
+#define KRAKEN2_SERVER_REPORTS_H_
 
-#include "report_server.h"
+#include <sstream>
+
 #include "kraken2_headers.h"
 #include "taxonomy.h"
 #include "kraken2_data.h"
@@ -9,13 +10,12 @@
 
 namespace kraken2
 {
-    void PrintKrakenStyleReportLine(std::ostringstream &ofs, bool report_kmer_data,
-                                    uint64_t total_seqs, READCOUNTER clade_counter, READCOUNTER taxon_counter,
-                                    const std::string &rank_str, uint32_t taxid, const std::string &sci_name, int depth);
-    void KrakenReportDFS(uint32_t taxid, std::ostringstream &ofs, bool report_zeros,
-                         bool report_kmer_data, Taxonomy &taxonomy, taxon_counters_t &clade_counters,
-                         taxon_counters_t &call_counters, uint64_t total_seqs, char rank_code, int rank_depth, int depth);
+    // Write a kraken2 style report to a string stream. The tree walk and
+    // line formatting are the upstream functions from reports.cc; this
+    // wrapper exists because upstream ReportKrakenStyle writes to a file.
+    // A header line naming the columns is written first.
     void ReportKrakenStyle(std::ostringstream &ss, bool report_zeros, bool report_kmer_data,
-                           Taxonomy &taxonomy, taxon_counters_t &call_counters, uint64_t total_seqs, uint64_t total_unclassified);
+                           Taxonomy &taxonomy, taxon_counters_t &call_counters, uint64_t total_seqs,
+                           uint64_t total_unclassified);
 }
 #endif

@@ -4,6 +4,90 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.0] - 2026-09-27
+### Added
+- Classification against several databases at once (`--db` repeated),
+  matching `k2 classify --db a,b` in Kraken 2.17: a merged taxonomy is built
+  from the databases' taxonomies and each read is called from the LCA of its
+  hits across databases. Output is identical to `k2` on the test databases.
+  `--strict-merge` applies `--confidence` and `--hit-groups` to the merged
+  call, which `k2` does not. Design in `docs/MULTI_DB.md`.
+- TLS. The server takes `--tls-cert` and `--tls-key`, and `--tls-ca` to
+  require client certificates. The client takes `--tls`, `--tls-ca`,
+  `--tls-cert`, `--tls-key` and `--tls-server-name`. Without these the
+  server prints a warning and runs unencrypted as before.
+- A Python client package (`python/`, `pip install --no-build-isolation
+  ./python`) with a `k2client` command taking the same options as the C++
+  client, and a library API that streams any iterable of records and yields
+  results in input order. Its tests compare its output with the C++ client.
+- A GitHub Actions workflow building and testing on Linux and macOS.
+- `--allow-remote-shutdown` on the server. The `RemoteShutdown` RPC is
+  refused with `PERMISSION_DENIED` unless it is given.
+- Paired-end classification. The client accepts a mate file with `--sequence2`
+  and the server classifies each pair as one fragment, matching `kraken2 --paired`
+  (pooled minimizers, `|:|` marker in the hit list, `len1|len2` length column,
+  `/1` and `/2` stripped from the read id). Pairing is decided per read, so
+  single-end and paired-end clients can share a server.
+### Changed
+- Kraken2 submodule updated from 2.1.2 to 2.17.2 (commit 01fb1d9). The server
+  now reads databases with 40-bit hash cells and uses batched hash lookups.
+  Per-read output and reports are identical to `kraken2` 2.17.2.
+- The taxonomy and hash table are loaded in the background after the server
+  starts listening, as the client readiness check already assumed.
+- The classification thread pool defaults to the number of hardware threads
+  instead of one thread.
+- The client no longer sends the full header line and a text copy of each
+  record, and the server no longer sends the scientific name per read. Both
+  fields were unused and roughly doubled the request size.
+- Result batches are handed to the writer thread through a blocking queue
+  instead of two busy-waiting loops, and read batches are moved rather than
+  copied between the reader, the queue and the gRPC messages on both sides.
+- The server limits the number of request batches buffered per stream, so a
+  fast client cannot make the server hold its whole input in memory.
+- The conda recipe and CI use the conda-forge `libgrpc` and `libprotobuf`
+  packages instead of building gRPC from source.
+- CI compiles and smoke tests the server and client on every push, runs the
+  unit tests, and runs the kraken2 parity test with a cached test database.
+- Results are returned in the order the reads were sent, as with `kraken2`,
+  whatever the number of classification threads.
+- The vendored BS::thread_pool header is replaced by a small worker pool
+  built on the project's own queue.
+- Warnings are errors for the project's own sources in CI (`-DENABLE_WERROR=ON`).
+- Server and client share a table-driven option parser; each option is
+  declared once, usage text is generated, and error messages name the
+  option and accepted range.
+- Unit tests (doctest, `-DBUILD_TESTS=ON`) for the pure classification
+  helpers, report writer, request conversion and queue. The helpers moved
+  from the classifier class into `server/classify_core.cc`.
+- The report writer uses the upstream kraken2 functions instead of a local
+  copy.
+- Usage errors on the command line exit with status 64 (`EX_USAGE`) instead
+  of 0.
+### Removed
+- The unused `thread_pool_light.hpp`. The unused proto fields `header`,
+  `str_representation` and `name` are marked deprecated but kept for
+  compatibility.
+### Fixed
+- Translated search against protein databases classified nothing after the
+  Kraken2 update, because kraken2 2.1.3 and later require an explicit call to
+  initialise the codon tables. The server now calls it when the database is
+  a protein database, and the parity test covers translated search with a
+  synthetic protein database built by `testing/make_protein_db.sh`.
+- A FASTQ record whose quality string length differs from its sequence, with
+  `--min-quality` set, is reported as unclassified instead of terminating the
+  server. Covered by `testing/parity_test.sh` using the `raw_client` test tool. The client now reports truncated or unreadable records and exits
+  with a non-zero status rather than treating them as end of input.
+- The classification summary was read without locking while another stream
+  could be rewriting it.
+- Ctrl-C during database load waits for the loader thread instead of
+  destroying the classifier underneath it. A second shutdown signal no longer
+  throws.
+- Statistics for an empty stream printed NaN percentages.
+- The client `-i` / `-I` short options for `--host-ip` were not accepted.
+- The client closed an uninitialised file handle when a reader was destroyed.
+- The client exits with a non-zero status when an input file cannot be opened
+  or when paired-end inputs contain different numbers of reads.
+
 ## [v0.1.8]
 ### Fixed
 - Receive size of messages in client raised to accomodate larger requests.

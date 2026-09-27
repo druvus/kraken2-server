@@ -1,12 +1,23 @@
 3rdparty/
 build/
+build-conda/
 grpc/
 proto-build/
 
 testing/virus-zymo-kraken*
 testing/*.fastq*
+testing/tinyprot/
+testing/multidb/
 
 .vscode/
 *.DS_Store
 *.swp
 *.swo
+
+# Python client: generated stubs and packaging artefacts
+python/kraken2_client/Kraken2_pb2.py
+python/kraken2_client/Kraken2_pb2_grpc.py
+python/*.egg-info/
+python/build/
+__pycache__/
+.pytest_cache/

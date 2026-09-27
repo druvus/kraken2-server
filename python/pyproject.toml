@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64", "grpcio-tools>=1.60"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kraken2-client"
+version = "0.2.0"
+description = "Python client for kraken2_server, a gRPC server around the Kraken 2 classifier"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Oxford Nanopore Technologies PLC. Public License Version 1.0"}
+dependencies = ["grpcio>=1.60", "protobuf>=4.21"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+k2client = "kraken2_client.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["kraken2_client*"]

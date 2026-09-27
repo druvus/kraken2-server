@@ -1,6 +1,6 @@
 package:
-  name: {{ environ.get('CONDA_PKG') }}
-  version: {{ environ.get('CONDA_PKG_VERSION') }}
+  name: {{ environ.get('CONDA_PKG', 'kraken2-server') }}
+  version: {{ environ.get('CONDA_PKG_VERSION', '0.0.0') }}
 
 source:
     path: ..
@@ -11,25 +11,34 @@ build:
 requirements:
     build:
         - {{ compiler('cxx') }}
-        - git
-        - make
         - cmake
+        - make
+        - llvm-openmp  # [osx]
+    host:
+        - libgrpc
+        - libprotobuf
+        - zlib
+        - llvm-openmp  # [osx]
+    run:
+        - libgrpc
+        - libprotobuf
+        - zlib
+        - llvm-openmp  # [osx]
 
 test:
     commands:
-        kraken2_server --help
-        kraken2_client --help
+        - kraken2_server --help
+        - kraken2_client --help
 
 about:
-    home: "https://github.com/epi2me-labs/fastcat"
-    license: MIT 
-    license_family: MIT
+    home: "https://github.com/epi2me-labs/kraken2-server"
+    license: Other
+    license_family: Other
     license_file: LICENSE
-    summary: "Server implementation of kraken2"
-    doc_url: https://github.com/epi2me-labs/kraken2
-    dev_url: https://github.com/epi2me-labs/kraken2 
+    summary: "Server-client implementation of the kraken2 classifier"
+    doc_url: https://github.com/epi2me-labs/kraken2-server
+    dev_url: https://github.com/epi2me-labs/kraken2-server
 
 extra:
     recipe-maintainers:
         - cjw85
-
