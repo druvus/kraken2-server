@@ -1,5 +1,4 @@
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -81,7 +80,8 @@ public:
      * @param sequence2_name path to mates (R2), empty for single-end data
      * @return EX_IOERR if sequences could not be read
      * @return EX_DATAERR if the two paired-end inputs have different lengths
-     * @return EX_UNAVAILABLE if sequences could nto be sent to server
+     * @return EX_UNAVAILABLE if sequences could not be sent to server
+     * @return EX_PROTOCOL if the server returned fewer results than reads sent
      * @return else gRPC status code
      */
     int ClassifySequences(const std::string &sequence_name,
@@ -121,15 +121,23 @@ public:
         recv_reads.wait();
         std::cerr << "Done waiting" << std::endl;
 
-        std::cerr << "Sent    : " << stream_batches.get() << std:: endl;
-        std::cerr << "Received: " << recv_reads.get() << std::endl;
-        assert(seqs_in_flight==0);
+        const int sent = stream_batches.get();
+        const int received = recv_reads.get();
+        std::cerr << "Sent    : " << sent << std:: endl;
+        std::cerr << "Received: " << received << std::endl;
 
         // Handle the stream response
         Status status = stream->Finish();
         if (!status.ok()) {
             std::cerr << "Client RPC stream failed: " << status.error_message() << std::endl;
             return status.error_code();
+        }
+        if (received != sent) {
+            // The server completed the stream but dropped results, which
+            // it reports on its own log.
+            std::cerr << "Error: the server returned " << received << " results for "
+                      << sent << " reads; the output is incomplete." << std::endl;
+            return EX_PROTOCOL;
         }
         if (fastq_batches.get() < 0) {
             return EX_IOERR;
@@ -193,12 +201,15 @@ public:
             while (std::optional<std::vector<Kraken2SequenceRequest>> item = batches.pop_wait()) {
                 std::vector<Kraken2SequenceRequest> batch = std::move(*item);
                 bool show_msg = true;
-                while (seqs_in_flight + batch.size() >= MAX_IN_FLIGHT) {
+                while (!stream_closed && seqs_in_flight + batch.size() >= MAX_IN_FLIGHT) {
                     if (show_msg) {
                         show_msg = false;
                         std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
                     }
                     std::this_thread::sleep_for(10ms);
+                }
+                if (stream_closed) {
+                    break;
                 }
 
                 // rebatch to smaller batches for stream, moving each read
@@ -222,26 +233,41 @@ public:
                                 std::cerr << "Read is too large! Skipping." << std::endl;
                                 continue;
                             }
-                            writer->Write(single, WriteOptions().set_buffer_hint());
+                            if (!writer->Write(single, WriteOptions().set_buffer_hint())) {
+                                StreamFailed();
+                                break;
+                            }
                             seqs_in_flight.fetch_add(1);
                             seqs_sent++;
                         }
                     }
                     else {
-                        writer->Write(req);
+                        if (!writer->Write(req)) {
+                            StreamFailed();
+                            break;
+                        }
                         seqs_in_flight.fetch_add(bsize);
                         seqs_sent += bsize;
                     }
+                    if (stream_closed) {
+                        break;
+                    }
+                }
+                if (stream_closed) {
+                    break;
                 }
             }
         }
         catch (const std::exception &ex) {
             std::cerr << "Failed to send sequences"
                       << ": " << ex.what() << std::endl;
-            writer->WritesDone();
-            return seqs_sent;
+            StreamFailed();
         }
 
+        if (stream_closed) {
+            // Release the file reader, which may be blocked on a full queue.
+            batches.close();
+        }
         writer->WritesDone();
         return seqs_sent;
     }
@@ -271,8 +297,10 @@ public:
         catch (const std::exception &ex) {
             std::cerr << "Failed to receive responses"
                       << ": " << ex.what() << std::endl;
-            return n_reads;
         }
+        // No more results will arrive, whether the stream ended normally
+        // or the server went away.
+        stream_closed = true;
         return n_reads;
     }
     
@@ -316,8 +344,11 @@ public:
                 }
                 if (n_reads > 0) {
                     n_batches++;
-                    // blocks while MAX_BATCHES are already buffered
-                    batches_queue.push(std::move(seqs));
+                    // blocks while MAX_BATCHES are already buffered; false
+                    // once the writer has closed the queue after a failure
+                    if (!batches_queue.push(std::move(seqs))) {
+                        break;
+                    }
                 }
                 if (n_reads < FASTQ_BATCH_SIZE) { break; }
             }
@@ -348,6 +379,17 @@ private:
 
     // Set by FastBatcher when R1 and R2 have different read counts.
     std::atomic<bool> pairs_mismatched{false};
+
+    // Set when the stream can no longer carry results: a write failed or
+    // the reader saw the end of the stream. The writer stops sending and
+    // stops waiting for in-flight results, which would never arrive.
+    std::atomic<bool> stream_closed{false};
+
+    void StreamFailed() {
+        if (!stream_closed.exchange(true)) {
+            std::cerr << "The stream to the server failed; not sending more reads." << std::endl;
+        }
+    }
 
     int WaitForServer() {
         // The server answers UNAVAILABLE with a message starting "Index not
