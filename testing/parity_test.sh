@@ -101,6 +101,64 @@ echo "+++ Empty input +++"
 : | "$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence - > /dev/null 2>&1
 check "empty input exit code" 0 $?
 
+# Illumina-style pairs and long reads built from the test reads by
+# make_longread_testdata.py (see its docstring for the sets).
+echo "+++ Illumina-style paired-end +++"
+LR=$WORK/longread
+python3 ./make_longread_testdata.py $READS $LR > $WORK/longread_data.log 2>&1
+check "long-read test data generated" 0 $?
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --paired \
+    --report $WORK/ref_casava.report --output $WORK/ref_casava.out $LR/ill_casava_1.fq.gz $LR/ill_casava_2.fq.gz > /dev/null 2>&1
+check "reference kraken2 CASAVA paired run" 0 $?
+"$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $LR/ill_casava_1.fq.gz --sequence2 $LR/ill_casava_2.fq.gz \
+    --report $WORK/casava.report > $WORK/casava.out 2> $WORK/casava.err
+check "CASAVA paired-end client exit code" 0 $?
+check "CASAVA paired-end output identical" 0 "$(diff $WORK/casava.out $WORK/ref_casava.out | grep -c '^[<>]')"
+check "CASAVA paired-end report identical" 0 "$(diff <(tail -n +2 $WORK/casava.report) $WORK/ref_casava.report | grep -c '^[<>]')"
+check "pairs with both mates shorter than k" "$(grep -c '|:|$' $WORK/ref_casava.out)" "$(grep -c '|:|$' $WORK/casava.out)"
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --paired \
+    --output $WORK/ref_slash.out $LR/ill_slash_1.fq $LR/ill_slash_2.fq > /dev/null 2>&1
+"$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $LR/ill_slash_1.fq --sequence2 $LR/ill_slash_2.fq > $WORK/slash.out 2> /dev/null
+check "/1 /2 paired-end output identical" 0 "$(diff $WORK/slash.out $WORK/ref_slash.out | grep -c '^[<>]')"
+check "/1 stripped from read ids" SRR000001.1 "$(head -1 $WORK/slash.out | cut -f2)"
+"$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $LR/ill_casava_1.fq.gz --sequence2 $LR/ill_short_2.fq.gz > $WORK/casava_mism.out 2> /dev/null
+check "CASAVA mismatched pairs exit code" 65 $?
+check "CASAVA mismatched pairs classify complete pairs only" 0 "$(diff $WORK/casava_mism.out <(head -1000 $WORK/ref_casava.out) | grep -c '^[<>]')"
+
+echo "+++ Long reads +++"
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 \
+    --report $WORK/ref_long_mixed.report --output $WORK/ref_long_mixed.out $LR/long_mixed.fq > /dev/null 2>&1
+check "reference kraken2 long-read run" 0 $?
+"$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $LR/long_mixed.fq \
+    --report $WORK/long_mixed.report > $WORK/long_mixed.out 2> $WORK/long_mixed.err
+check "long-read client exit code" 0 $?
+check "long-read output identical (reads up to 5 Mb)" 0 "$(diff $WORK/long_mixed.out $WORK/ref_long_mixed.out | grep -c '^[<>]')"
+check "long-read report identical" 0 "$(diff <(tail -n +2 $WORK/long_mixed.report) $WORK/ref_long_mixed.report | grep -c '^[<>]')"
+# 2000 reads of 40 kb exceed the 128 MB message limit, so the client must
+# split the batch.
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --output $WORK/ref_long_40k.out $LR/long_40k.fq > /dev/null 2>&1
+"$CLIENT" --port $PORT --host-ip 127.0.0.1 --sequence $LR/long_40k.fq > $WORK/long_40k.out 2> $WORK/long_40k.err
+check "40 kb reads client exit code" 0 $?
+check "40 kb reads output identical (batch over message limit)" 0 "$(diff $WORK/long_40k.out $WORK/ref_long_40k.out | grep -c '^[<>]')"
+
+# A server that disappears mid-stream must not leave the client hanging.
+# The input has more reads than the client's in-flight limit so the writer
+# would wait for results that never come.
+echo "+++ Server lost mid-stream +++"
+for i in $(seq 1 30); do cat $READS; done > $WORK/many.fq.gz
+LOST_PORT=$((PORT + 1))
+"$SERVER" --db $DB --host-ip 127.0.0.1 --port $LOST_PORT --thread-pool 1 > $WORK/server_lost.log 2>&1 &
+LOST_PID=$!
+sleep 4
+timeout 60 "$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 --sequence $WORK/many.fq.gz > $WORK/lost.out 2> $WORK/lost.err &
+LOST_CLIENT=$!
+sleep 5
+kill -9 $LOST_PID
+wait $LOST_CLIENT
+LOST_RC=$?
+check "client had started receiving results" 1 "$([ $(wc -l < $WORK/lost.out) -gt 0 ] && echo 1)"
+check "client exits with an error after losing the server (124 = hung)" 1 "$([ $LOST_RC -ne 0 ] && [ $LOST_RC -ne 124 ] && echo 1 || echo $LOST_RC)"
+
 echo "+++ Shutdown +++"
 "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
 wait $SERVER_PID
