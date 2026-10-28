@@ -124,9 +124,12 @@ public:
     void LoadIndex();
 
     /**
-     * @brief Classify sequences in a input queue and populate the classification queue.
+     * @brief Classify the request batches on a stream, writing results in
+     *        input order, and generate the report into results. Returns a
+     *        non-OK status when a batch could not be classified, in which
+     *        case the client has not received every result.
      */
-    void ProcessSequenceStream(
+    grpc::Status ProcessSequenceStream(
         ServerContext *context, ServerStream *stream, std::string &results);
 
     /**

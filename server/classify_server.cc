@@ -1,4 +1,5 @@
 #include <condition_variable>
+#include <cstdlib>
 #include <map>
 #include <fstream>
 #include <getopt.h>
@@ -177,8 +178,9 @@ void Kraken2ServerClassifier::LoadIndex() {
 // and empty. Batches finish in any order on the pool; they are held here
 // and written in input order, as kraken2 does, so the client sees results
 // in the same order as its reads. Runs on its own thread so writes overlap
-// with classification.
-static void ResultsHandler(
+// with classification. Returns the number of batches that could not be
+// written because an earlier batch never arrived.
+static size_t ResultsHandler(
         ServerStream *stream,
         taxon_counters_t &stream_taxon_counters,
         ClassificationStats &stream_stats,
@@ -211,9 +213,10 @@ static void ResultsHandler(
         std::cerr << "Warning: " << pending.size()
                   << " result batch(es) never reached the writer." << std::endl;
     }
+    return pending.size();
 }
 
-void Kraken2ServerClassifier::ProcessSequenceStream(
+grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
         ServerContext *context, ServerStream *stream, std::string &results) {
     std::cerr << "Starting stream handler." << std::endl;
     stream->SendInitialMetadata();
@@ -228,9 +231,19 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     // Queue and thread that aggregate batch results and write them to the
     // output stream.
     ThreadSafeQueue<BatchResults> results_queue;
-    std::thread results_thread(ResultsHandler,
-        stream, std::ref(stream_taxon_counters), std::ref(stream_stats),
-        std::ref(results_queue));
+    std::promise<size_t> unwritten_promise;
+    std::future<size_t> unwritten = unwritten_promise.get_future();
+    std::thread results_thread([&]() {
+        unwritten_promise.set_value(ResultsHandler(
+            stream, stream_taxon_counters, stream_stats, results_queue));
+    });
+
+    // Set when a batch throws. The stream is then failed rather than
+    // completed with results missing, since the writer holds every later
+    // batch back to keep the output in order.
+    std::atomic<bool> failed{false};
+    std::string failure;
+    std::mutex failure_mtx;
 
     // Backpressure: limit the number of request batches held by this stream
     // (queued in the pool or being classified) so a fast client cannot
@@ -242,7 +255,7 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
 
     // Classify while reads are still being received on the input stream
     uint64_t sequence = 0;
-    while (!context->IsCancelled()) {
+    while (!context->IsCancelled() && !failed) {
         // Each batch is owned by a shared_ptr so the pool can copy the task
         // object without copying the message.
         auto req = std::make_shared<Kraken2SequenceRequestMulti>();
@@ -255,12 +268,16 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
             in_flight++;
         }
         const uint64_t this_sequence = sequence++;
-        pool.push([this, req, this_sequence, &results_queue, &in_flight_mtx, &in_flight_cv, &in_flight]() {
+        pool.push([this, req, this_sequence, &results_queue, &in_flight_mtx, &in_flight_cv, &in_flight,
+                   &failed, &failure, &failure_mtx]() {
             try {
                 ProcessBatch(*req, this_sequence, results_queue);
             }
             catch (const std::exception &ex) {
-                std::cerr << "Error classifying batch: " << ex.what() << std::endl;
+                std::cerr << "Error classifying batch " << this_sequence << ": " << ex.what() << std::endl;
+                std::lock_guard<std::mutex> lock(failure_mtx);
+                if (!failed.exchange(true))
+                    failure = ex.what();
             }
             std::lock_guard<std::mutex> lock(in_flight_mtx);
             in_flight--;
@@ -276,19 +293,35 @@ void Kraken2ServerClassifier::ProcessSequenceStream(
     }
     results_queue.close();
     results_thread.join();
+    const size_t unwritten_batches = unwritten.get();
 
     gettimeofday(&tv2, nullptr);
-    // generate the report, and update servers total history
+    // generate the report, and update servers total history. Only the
+    // results that were written are counted.
     GenerateReport(
         results, summary, opts, *taxonomy, tv1, tv2, stream_stats, total_stats,
         stream_taxon_counters, total_taxon_counters, stats_mtx);
 
     std::cerr << "Finished stream handler." << std::endl;
+    if (failed || unwritten_batches > 0) {
+        std::string what = failed ? failure : "a result batch was lost";
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+            "Classification of a request batch failed: " + what +
+            "; the results are incomplete.");
+    }
+    return grpc::Status::OK;
 }
 
 void Kraken2ServerClassifier::ProcessBatch(
     const Kraken2SequenceRequestMulti &reqs, uint64_t sequence,
     ThreadSafeQueue<BatchResults> &result_q) {
+
+    // Test hook: KRAKEN2_SERVER_FAIL_BATCH=<n> makes batch n of every
+    // stream fail, so that the error path can be exercised end to end.
+    static const char *fail_batch = getenv("KRAKEN2_SERVER_FAIL_BATCH");
+    if (fail_batch != nullptr && sequence == strtoull(fail_batch, nullptr, 10)) {
+        throw std::runtime_error("KRAKEN2_SERVER_FAIL_BATCH test hook");
+    }
 
     MinimizerScanner scanner(
         idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,
