@@ -30,9 +30,10 @@ __all__ = ["Client", "Classification", "Record", "PairedRecord", "read_fastx", "
 Record = Tuple[str, str, str]
 PairedRecord = Tuple[str, str, str, str, str]
 
-BATCH_SIZE = 2000        # records per gRPC message, as in the C++ client
+BATCH_SIZE = 2000        # at most this many records per gRPC message
+BATCH_BYTES = 32 * 1024 * 1024   # or this much sequence and quality data
 MAX_IN_FLIGHT = 64000    # records sent but not yet answered
-MAX_MESSAGE_BYTES = 128 * 1024 * 1024
+MAX_MESSAGE_BYTES = 128 * 1024 * 1024   # the server's message limit
 
 
 class ServerNotReady(RuntimeError):
@@ -153,21 +154,44 @@ class Client:
                  report: Optional[io.TextIOBase] = None) -> Iterator[Classification]:
         """Stream records to the server and yield one Classification per
         record, in input order. If `report` is a writable text stream, the
-        kraken2 style report for this stream is written to it at the end."""
+        kraken2 style report for this stream is written to it at the end.
+
+        Records are sent in messages of at most BATCH_SIZE records or
+        BATCH_BYTES of sequence, so long reads never exceed the server's
+        message limit; a single record over that limit raises ValueError.
+        An exception raised by the `records` iterable (for example from
+        read_pairs on mismatched inputs) is re-raised after the results for
+        the records already sent have been yielded."""
         in_flight = threading.Semaphore(MAX_IN_FLIGHT)
         summary = []
+        # An exception from the records iterable. It cannot propagate out
+        # of the request generator, which gRPC runs on its own thread and
+        # would report as an opaque UNKNOWN status, so it is kept here and
+        # raised once the stream has been drained.
+        failure = []
 
         def requests():
             batch = pb.Kraken2SequenceRequestMulti()
-            for rec in records:
-                in_flight.acquire()
-                r = batch.seqs.add()
-                _fill(r, rec[0], rec[1], rec[2])
-                if len(rec) == 5:
-                    _fill(r.mate, rec[0], rec[3], rec[4])
-                if len(batch.seqs) >= BATCH_SIZE:
-                    yield batch
-                    batch = pb.Kraken2SequenceRequestMulti()
+            batch_bytes = 0
+            try:
+                for rec in records:
+                    rec_bytes = _record_bytes(rec)
+                    if rec_bytes > MAX_MESSAGE_BYTES:
+                        raise ValueError("record %s is larger than the %d MB message limit"
+                                         % (rec[0], MAX_MESSAGE_BYTES // (1024 * 1024)))
+                    if len(batch.seqs) and (len(batch.seqs) >= BATCH_SIZE
+                                            or batch_bytes + rec_bytes > BATCH_BYTES):
+                        yield batch
+                        batch = pb.Kraken2SequenceRequestMulti()
+                        batch_bytes = 0
+                    in_flight.acquire()
+                    r = batch.seqs.add()
+                    _fill(r, rec[0], rec[1], rec[2])
+                    if len(rec) == 5:
+                        _fill(r.mate, rec[0], rec[3], rec[4])
+                    batch_bytes += rec_bytes
+            except Exception as e:  # noqa: BLE001 - re-raised by classify()
+                failure.append(e)
             if len(batch.seqs):
                 yield batch
 
@@ -179,8 +203,19 @@ class Client:
                                          c.paired, c.size2)
             elif result.HasField("summary"):
                 summary.append(result.summary)
+        if failure:
+            raise failure[0]
         if report is not None:
             report.write("".join(summary))
+
+
+def _record_bytes(rec) -> int:
+    """Approximate serialized size of a record: the strings plus a small
+    allowance for field tags and lengths."""
+    n = len(rec[0]) + len(rec[1]) + len(rec[2]) + 16
+    if len(rec) == 5:
+        n += len(rec[0]) + len(rec[3]) + len(rec[4]) + 16
+    return n
 
 
 def _fill(msg, read_id: str, seq: str, quals: str):

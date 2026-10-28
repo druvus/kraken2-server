@@ -13,6 +13,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import time
 
 import pytest
@@ -75,6 +76,22 @@ def pairs(tmp_path_factory):
     return str(r1), str(r2)
 
 
+@pytest.fixture(scope="module")
+def testdata(tmp_path_factory):
+    """Illumina-style pairs and long reads built by testing/make_longread_testdata.py."""
+    d = tmp_path_factory.mktemp("longread")
+    subprocess.run([sys.executable, os.path.join(ROOT, "testing", "make_longread_testdata.py"), READS, str(d)],
+                   check=True, capture_output=True)
+    return d
+
+
+def py_cli(port, *args):
+    """Run the k2client command line and return (returncode, stdout, stderr)."""
+    r = subprocess.run([sys.executable, "-m", "kraken2_client.cli", "--host-ip", "127.0.0.1", "--port", str(port)] + list(args),
+                       capture_output=True, text=True)
+    return r.returncode, r.stdout, r.stderr
+
+
 def cpp_client(port, *args):
     return subprocess.run([CPP_CLIENT, "--host-ip", "127.0.0.1", "--port", str(port)] + list(args),
                           check=True, capture_output=True, text=True).stdout
@@ -131,6 +148,50 @@ def test_paired_end_matches_cpp_client(server, pairs):
     assert lines == ref
     assert all("|:|" in line for line in lines)
     assert lines[0].split("\t")[1] == "frag1"
+
+
+def test_illumina_pairs_match_cpp_client(server, testdata):
+    r1, r2 = str(testdata / "ill_casava_1.fq.gz"), str(testdata / "ill_casava_2.fq.gz")
+    with Client("127.0.0.1", server.port) as c:
+        lines = [h.to_kraken_line() for h in c.classify(read_pairs(r1, r2))]
+    ref = cpp_client(server.port, "--sequence", r1, "--sequence2", r2).rstrip("\n").split("\n")
+    assert lines == ref
+    assert len(lines) == 3390
+    # CASAVA names are the same in both mates; the comment is not part of the id
+    assert lines[0].split("\t")[1] == "M00001:7:000000000-A1B2C:1:1101:10000:1000"
+
+
+def test_long_reads_match_cpp_client(server, testdata):
+    path = str(testdata / "long_mixed.fq")
+    with Client("127.0.0.1", server.port) as c:
+        lines = [h.to_kraken_line() for h in c.classify(read_fastx(path))]
+    ref = cpp_client(server.port, "--sequence", path).rstrip("\n").split("\n")
+    assert lines == ref
+    assert max(int(l.split("\t")[3]) for l in lines) >= 5_000_000
+
+
+def test_long_reads_over_message_limit(server, testdata):
+    # 2000 reads of 40 kb do not fit in one 128 MB message
+    path = str(testdata / "long_40k.fq")
+    with Client("127.0.0.1", server.port) as c:
+        lines = [h.to_kraken_line() for h in c.classify(read_fastx(path))]
+    ref = cpp_client(server.port, "--sequence", path).rstrip("\n").split("\n")
+    assert len(lines) == 2100
+    assert lines == ref
+
+
+def test_cli_mismatched_pairs(server, testdata):
+    r1, r2 = str(testdata / "ill_casava_1.fq.gz"), str(testdata / "ill_short_2.fq.gz")
+    rc, out, err = py_cli(server.port, "--sequence", r1, "--sequence2", r2)
+    assert rc == 65
+    assert "different numbers of reads" in err
+    # the complete pairs are classified before the error is reported, as
+    # with the C++ client
+    ref = subprocess.run([CPP_CLIENT, "--host-ip", "127.0.0.1", "--port", str(server.port),
+                          "--sequence", r1, "--sequence2", r2], capture_output=True, text=True)
+    assert ref.returncode == 65
+    assert out == ref.stdout
+    assert out.count("\n") == 1000
 
 
 def test_results_arrive_in_input_order(server):
