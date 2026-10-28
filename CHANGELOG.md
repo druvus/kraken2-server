@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them, together with the lost-server and failed-batch paths.
 - The build notes and CI install `libsystemd` on Linux, which current
   conda-forge `libgrpc` builds link against without depending on.
+- The GitHub workflow runs on pull requests and pushes to `master` only,
+  cancels superseded runs, and runs the parity suite and Python tests on
+  Linux; macOS builds and runs the unit tests.
 
 ## [v0.2.0] - 2026-09-27
 ### Added
