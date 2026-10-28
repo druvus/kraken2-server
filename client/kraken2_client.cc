@@ -1,5 +1,8 @@
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <fstream>
 #include <future>
 #include <random>
@@ -62,10 +65,70 @@ struct Options
 typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequestMulti, Kraken2SequenceStreamResult>> ClientStream;
 
 
-#define ST_BATCH_SIZE 2000     // reads in a gRPC batch
-#define MAX_IN_FLIGHT 64000    // total reads in gRPC system
-#define FASTQ_BATCH_SIZE 4000  // reads to read at once from fastq
-#define MAX_BATCHES 64         // number of stream batches to buffer from fastq
+// Buffering is bounded in bytes as well as reads so that long reads do not
+// make the client hold its whole input in memory: a file batch holds at
+// most FASTQ_BATCH_SIZE reads or FASTQ_BATCH_BYTES of data, MAX_BATCHES of
+// them are buffered ahead of the writer, and at most MAX_IN_FLIGHT_BYTES
+// (or MAX_IN_FLIGHT reads) are sent and not yet answered. Worst case
+// the client holds about MAX_BATCHES * FASTQ_BATCH_BYTES + MAX_IN_FLIGHT_BYTES.
+#define ST_BATCH_SIZE 2000                            // reads in a gRPC message
+#define MAX_IN_FLIGHT 64000                           // reads sent but not yet answered
+#define MAX_IN_FLIGHT_BYTES (256ULL * 1024 * 1024)    // bytes sent but not yet answered
+#define FASTQ_BATCH_SIZE 4000                         // reads in a file batch
+#define FASTQ_BATCH_BYTES (8ULL * 1024 * 1024)        // bytes in a file batch
+#define MAX_BATCHES 16                                // file batches buffered ahead of the writer
+
+// Reads and bytes sent and not yet answered. The writer adds a message
+// after sending it and waits while the limits are exceeded; the reader
+// retires reads as results arrive, in order, and releases a message's
+// bytes once all of its reads are answered.
+class InFlight {
+public:
+    void add(uint64_t reads, uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(mtx_);
+        messages_.push_back({reads, bytes});
+        reads_ += reads;
+        bytes_ += bytes;
+    }
+    void retire_one() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        reads_--;
+        if (!messages_.empty() && ++answered_in_head_ == messages_.front().reads) {
+            bytes_ -= messages_.front().bytes;
+            messages_.pop_front();
+            answered_in_head_ = 0;
+        }
+        changed_.notify_all();
+    }
+    // Block until a message of the given size may be sent, or the stream
+    // has closed. Returns true when it may be sent.
+    bool wait_for_room(uint64_t reads, uint64_t bytes, std::atomic<bool> &closed) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        bool waited = false;
+        while (!closed && reads_ > 0 &&
+               (reads_ + reads > MAX_IN_FLIGHT || bytes_ + bytes > MAX_IN_FLIGHT_BYTES)) {
+            if (!waited) {
+                waited = true;
+                std::cerr << "Waiting before sending more. In-flight: " << reads_
+                          << " reads, " << bytes_ / (1024 * 1024) << " MB." << std::endl;
+            }
+            changed_.wait_for(lock, 100ms);
+        }
+        return !closed;
+    }
+    void wake() { changed_.notify_all(); }
+    uint64_t reads() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return reads_;
+    }
+private:
+    struct Message { uint64_t reads, bytes; };
+    std::mutex mtx_;
+    std::condition_variable changed_;
+    std::deque<Message> messages_;
+    uint64_t reads_ = 0, bytes_ = 0;
+    uint64_t answered_in_head_ = 0;
+};
 
 class SequenceClient {
 
@@ -93,7 +156,7 @@ public:
 
         ClientContext context;
         ClientStream stream(sequence_stub->ClassifyStream(&context));
-        std::atomic<uint64_t> seqs_in_flight = 0;
+        InFlight in_flight;
 
         // Bounded queue of read batches between the file reader and the
         // gRPC writer. The reader blocks when MAX_BATCHES are buffered and
@@ -108,12 +171,12 @@ public:
         // take data from queue and send over gRPC
         std::future<int> stream_batches = std::async(
             std::launch::async, &SequenceClient::StreamWriter, this,
-            std::ref(seqs_in_flight), std::ref(batches_queue), std::ref(stream));
+            std::ref(in_flight), std::ref(batches_queue), std::ref(stream));
 
         // reading back results on gRPC stream
         std::future<int> recv_reads = std::async(
             std::launch::async, &SequenceClient::StreamReader, this,
-            std::ref(seqs_in_flight), std::ref(report_file), std::ref(stream));
+            std::ref(in_flight), std::ref(report_file), std::ref(stream));
 
         // wait for things to finish in order
         fastq_batches.wait();
@@ -190,8 +253,26 @@ public:
         return status.error_code();
     }
 
+    // Send one message, waiting first until it fits within the in-flight
+    // limits. Returns the number of reads sent, 0 once the stream has failed.
+    uint64_t SendMessage(Kraken2SequenceRequestMulti &req, uint64_t msg_size,
+                         InFlight &in_flight, ClientStream &writer, bool buffer_hint) {
+        const uint64_t reads = req.seqs_size();
+        if (!in_flight.wait_for_room(reads, msg_size, stream_closed)) {
+            return 0;
+        }
+        bool ok = buffer_hint ? writer->Write(req, WriteOptions().set_buffer_hint())
+                              : writer->Write(req);
+        if (!ok) {
+            StreamFailed();
+            return 0;
+        }
+        in_flight.add(reads, msg_size);
+        return reads;
+    }
+
     int StreamWriter(
-            std::atomic<uint64_t> &seqs_in_flight,
+            InFlight &in_flight,
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches,
             ClientStream &writer) {
         int seqs_sent = 0;
@@ -200,22 +281,13 @@ public:
             // the queue and every batch has been taken.
             while (std::optional<std::vector<Kraken2SequenceRequest>> item = batches.pop_wait()) {
                 std::vector<Kraken2SequenceRequest> batch = std::move(*item);
-                bool show_msg = true;
-                while (!stream_closed && seqs_in_flight + batch.size() >= MAX_IN_FLIGHT) {
-                    if (show_msg) {
-                        show_msg = false;
-                        std::cerr << "Waiting before sending more. In-flight: " << seqs_in_flight << "." << std::endl;
-                    }
-                    std::this_thread::sleep_for(10ms);
-                }
-                if (stream_closed) {
-                    break;
-                }
 
                 // rebatch to smaller batches for stream, moving each read
-                // into the message rather than copying it
+                // into the message rather than copying it. File batches are
+                // already bounded in bytes; the message limit is a safety net
+                // for a single read of exceptional size.
                 const uint64_t MAX_SIZE = 128 * 1024 * 1024;
-                for(size_t i = 0; i < batch.size(); i += ST_BATCH_SIZE) {
+                for(size_t i = 0; i < batch.size() && !stream_closed; i += ST_BATCH_SIZE) {
                     auto last = std::min(batch.size(), i + ST_BATCH_SIZE);
                     size_t bsize = last - i;
                     Kraken2SequenceRequestMulti req;
@@ -229,28 +301,20 @@ public:
                         for (auto &read : *req.mutable_seqs()) {
                             Kraken2SequenceRequestMulti single;
                             single.mutable_seqs()->Add(std::move(read));
-                            if (single.ByteSizeLong() > MAX_SIZE) {
-                                std::cerr << "Read is too large! Skipping." << std::endl;
+                            uint64_t single_size = single.ByteSizeLong();
+                            if (single_size > MAX_SIZE) {
+                                std::cerr << single.seqs(0).id() << ": read is larger than the "
+                                          << MAX_SIZE / (1024 * 1024) << " MB message limit; skipping." << std::endl;
                                 continue;
                             }
-                            if (!writer->Write(single, WriteOptions().set_buffer_hint())) {
-                                StreamFailed();
+                            seqs_sent += SendMessage(single, single_size, in_flight, writer, true);
+                            if (stream_closed) {
                                 break;
                             }
-                            seqs_in_flight.fetch_add(1);
-                            seqs_sent++;
                         }
                     }
                     else {
-                        if (!writer->Write(req)) {
-                            StreamFailed();
-                            break;
-                        }
-                        seqs_in_flight.fetch_add(bsize);
-                        seqs_sent += bsize;
-                    }
-                    if (stream_closed) {
-                        break;
+                        seqs_sent += SendMessage(req, msg_size, in_flight, writer, false);
                     }
                 }
                 if (stream_closed) {
@@ -273,7 +337,7 @@ public:
     }
 
     int StreamReader(
-            std::atomic<uint64_t> &seqs_in_flight, const std::string &report_file,
+            InFlight &in_flight, const std::string &report_file,
             ClientStream &reader) {
         Kraken2SequenceStreamResult result;
         int n_reads = 0;
@@ -283,7 +347,7 @@ public:
                     for (auto &res : result.classifications().classes()){
                         n_reads++;
                         PrintClassification(res);
-                        seqs_in_flight--;
+                        in_flight.retire_one();
                     }
                 }
                 else if (result.has_summary()) {
@@ -301,6 +365,7 @@ public:
         // No more results will arrive, whether the stream ended normally
         // or the server went away.
         stream_closed = true;
+        in_flight.wake();
         return n_reads;
     }
     
@@ -337,10 +402,11 @@ public:
                 std::vector<Kraken2SequenceRequest> seqs;
                 int n_reads;
                 if (paired) {
-                    n_reads = reader.read_pairs(seqs, FASTQ_BATCH_SIZE, *mate_reader, mismatched);
+                    n_reads = reader.read_pairs(seqs, FASTQ_BATCH_SIZE, *mate_reader, mismatched,
+                                                FASTQ_BATCH_BYTES);
                 }
                 else {
-                    n_reads = reader.read(seqs, FASTQ_BATCH_SIZE);
+                    n_reads = reader.read(seqs, FASTQ_BATCH_SIZE, FASTQ_BATCH_BYTES);
                 }
                 if (n_reads > 0) {
                     n_batches++;
@@ -350,7 +416,11 @@ public:
                         break;
                     }
                 }
-                if (n_reads < FASTQ_BATCH_SIZE) { break; }
+                // A batch ends early at the byte budget; the input is done
+                // when a reader has hit the end of its file or an error.
+                if (reader.last_status() < 0 || (paired && mate_reader->last_status() < 0)) {
+                    break;
+                }
             }
             if (mismatched) {
                 std::cerr << "Warning: paired-end inputs have different numbers of reads; "
