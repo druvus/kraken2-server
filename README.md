@@ -215,6 +215,7 @@ packages, which is also what the conda recipe in `conda/` and the CI use:
 ```
 mamba create -n k2build -c conda-forge cmake libgrpc libprotobuf zlib llvm-openmp cxx-compiler make
 mamba activate k2build
+# on Linux, current conda-forge libgrpc builds also need: mamba install libsystemd
 mkdir build && cd build
 cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release ..
 make -j 8
