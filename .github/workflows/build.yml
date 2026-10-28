@@ -1,8 +1,9 @@
 name: Build and test
 
-# Pull requests and pushes to master. A pull request branch is tested once,
-# through its pull request, and a newer push to the same branch cancels the
-# run still going.
+# One Linux job: build with warnings as errors, unit tests, the kraken2
+# parity suite and the Python client tests. Pull requests and pushes to
+# master; a newer push to the same branch cancels the run still going.
+# macOS is covered by the conda packaging on GitLab.
 on:
   pull_request:
   push:
@@ -12,15 +13,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash -el {0}
-
 jobs:
-  # Linux runs everything: build, unit tests, the kraken2 parity suite and
-  # the Python client tests.
-  linux:
+  test:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -81,40 +79,3 @@ jobs:
           # environment's grpcio-tools, matching its grpcio
           pip install --no-build-isolation ./python
           pytest -q python/tests
-
-  # macOS checks that the sources build and the unit tests pass. The
-  # parity suite is Linux-only; macOS runners are scarce and the classifier
-  # code is the same.
-  macos:
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - uses: mamba-org/setup-micromamba@v1
-        with:
-          environment-name: build
-          create-args: >-
-            cmake
-            make
-            cxx-compiler
-            libgrpc
-            libprotobuf
-            zlib
-            doctest
-            llvm-openmp
-          init-shell: bash
-          cache-environment: true
-          condarc: |
-            channels:
-              - conda-forge
-
-      - name: Build
-        run: |
-          cmake -S . -B build -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_TESTS=ON -DBUILD_TEST_TOOLS=ON -DENABLE_WERROR=ON
-          make -C build -j 4
-
-      - name: Unit tests
-        run: ./build/tests/unit_tests

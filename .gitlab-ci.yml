@@ -28,7 +28,8 @@ build-test:
         - wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
         - bash miniforge.sh -b -p /tmp/miniforge
         - source /tmp/miniforge/bin/activate
-        - mamba create -y -q -n build -c conda-forge cmake libgrpc libprotobuf zlib cxx-compiler make doctest
+        # libsystemd: current conda-forge libgrpc builds link against it without depending on it
+        - mamba create -y -q -n build -c conda-forge cmake libgrpc libprotobuf libsystemd zlib cxx-compiler make doctest
         - conda activate build
         - mkdir build && cd build
         - cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release -DBUILD_TEST_TOOLS=ON -DBUILD_TESTS=ON -DENABLE_WERROR=ON ..
@@ -56,7 +57,7 @@ parity-test:
         - wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O miniforge.sh
         - bash miniforge.sh -b -p /tmp/miniforge
         - source /tmp/miniforge/bin/activate
-        - mamba create -y -q -n parity -c conda-forge -c bioconda libgrpc libprotobuf zlib kraken2 seqkit
+        - mamba create -y -q -n parity -c conda-forge -c bioconda libgrpc libprotobuf libsystemd zlib kraken2 seqkit
         - conda activate parity
         - export SERVER=$PWD/build/server/kraken2_server
         - export CLIENT=$PWD/build/client/kraken2_client
