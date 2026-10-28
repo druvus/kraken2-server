@@ -50,6 +50,10 @@ jobs:
               - conda-forge
               - bioconda
 
+      - name: Install libsystemd (needed by conda-forge libgrpc on Linux)
+        if: runner.os == 'Linux'
+        run: micromamba install -y -n build -c conda-forge libsystemd
+
       - name: Configure
         run: |
           mkdir build && cd build

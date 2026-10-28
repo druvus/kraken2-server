@@ -17,6 +17,7 @@ requirements:
     host:
         - libgrpc
         - libprotobuf
+        - libsystemd  # [linux]
         - zlib
         - llvm-openmp  # [osx]
     run:
