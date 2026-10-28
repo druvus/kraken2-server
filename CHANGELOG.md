@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.2.1] - 2026-10-28
+### Fixed
+- The C++ client hung forever when the server went away mid-stream with
+  more than 64,000 reads still to send, waiting for results that would
+  never arrive. It now stops sending and exits with the gRPC status.
+- The Python client failed with `RESOURCE_EXHAUSTED` and no output on long
+  reads averaging more than about 32 kb, because it cut request messages
+  by record count only and exceeded the server's 128 MB message limit.
+  Messages are now also cut at 8 MB of sequence.
+- `k2client` on paired-end inputs with different numbers of reads exited
+  69 with "Exception iterating requests!" and no results, because the
+  error was raised inside the gRPC request generator. It now classifies
+  the complete pairs, prints the message and exits 65 like `kraken2_client`.
+- A batch that could not be classified on the server was dropped with a
+  log line, every later batch was held back, and the client exited 0 with
+  fewer lines than reads. The server now fails the stream with `INTERNAL`
+  (client exit 13), and the C++ client exits 76 should a completed stream
+  ever carry fewer results than reads sent.
+### Changed
+- Both clients bound their buffering in bytes as well as reads: file
+  batches of at most 8 MB, 16 batches read ahead, 256 MB in flight. The
+  C++ client's peak memory on a 1.5 GB nanopore input drops from 1.1 GB to
+  under 0.2 GB, and throughput against a 4-thread server improves because
+  smaller batches pipeline better. Output is unchanged.
+- `testing/make_longread_testdata.py` builds Illumina-style pairs and long
+  reads from the test reads; the parity script and the Python tests cover
+  them, together with the lost-server and failed-batch paths.
+- The build notes and CI install `libsystemd` on Linux, which current
+  conda-forge `libgrpc` builds link against without depending on.
+- The GitHub workflow runs on pull requests and pushes to `master` only,
+  cancels superseded runs, and runs the parity suite and Python tests on
+  Linux; macOS builds and runs the unit tests.
+
 ## [v0.2.0] - 2026-09-27
 ### Added
 - Classification against several databases at once (`--db` repeated),

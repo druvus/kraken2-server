@@ -120,7 +120,13 @@ public:
 
         std::string results;
 
-        classifier->ProcessSequenceStream(context, reader_writer, std::ref(results));
+        Status status = classifier->ProcessSequenceStream(context, reader_writer, std::ref(results));
+        if (!status.ok()) {
+            // The client gets the error instead of a completed stream with
+            // results missing.
+            std::cerr << status.error_message() << std::endl;
+            return status;
+        }
 
         // If connection is open, send a final message containing the summary.
         if (!context->IsCancelled()) {
