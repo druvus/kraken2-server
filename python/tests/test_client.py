@@ -185,9 +185,12 @@ def test_cli_mismatched_pairs(server, testdata):
     rc, out, err = py_cli(server.port, "--sequence", r1, "--sequence2", r2)
     assert rc == 65
     assert "different numbers of reads" in err
-    # the complete pairs are classified before the error is reported
-    ref = cpp_client(server.port, "--sequence", r1, "--sequence2", r2)
-    assert out == ref
+    # the complete pairs are classified before the error is reported, as
+    # with the C++ client
+    ref = subprocess.run([CPP_CLIENT, "--host-ip", "127.0.0.1", "--port", str(server.port),
+                          "--sequence", r1, "--sequence2", r2], capture_output=True, text=True)
+    assert ref.returncode == 65
+    assert out == ref.stdout
     assert out.count("\n") == 1000
 
 
