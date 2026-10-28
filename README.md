@@ -305,10 +305,10 @@ on the `PATH`; sections whose tools are missing are skipped with a notice.
 `python/tests` checks the Python client against the C++ client with pytest.
 
 Both CI configurations (`.github/workflows/build.yml` for the GitHub
-mirror, `.gitlab-ci.yml` for the ONT GitLab) build with warnings as errors
-and run the unit tests. On GitHub, pull requests and pushes to `master`
-run the parity script and the Python client tests on Linux, while macOS
-builds and runs the unit tests only; GitLab packages on tags.
+mirror, `.gitlab-ci.yml` for the ONT GitLab) build on Linux with warnings
+as errors and run the unit tests and the parity script. GitHub also runs
+the Python client tests, on pull requests and pushes to `master`; GitLab
+packages for Linux and macOS on tags.
 
 ## Relationship to upstream Kraken2
 
