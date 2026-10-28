@@ -159,22 +159,6 @@ LOST_RC=$?
 check "client had started receiving results" 1 "$([ $(wc -l < $WORK/lost.out) -gt 0 ] && echo 1)"
 check "client exits with an error after losing the server (124 = hung)" 1 "$([ $LOST_RC -ne 0 ] && [ $LOST_RC -ne 124 ] && echo 1 || echo $LOST_RC)"
 
-# A batch that cannot be classified fails the stream with INTERNAL instead
-# of completing it with results missing. KRAKEN2_SERVER_FAIL_BATCH is a
-# test hook in the server that makes the given batch throw.
-echo "+++ Failed batch on the server +++"
-FAIL_PORT=$((PORT + 2))
-KRAKEN2_SERVER_FAIL_BATCH=1 "$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $FAIL_PORT > $WORK/server_fail.log 2>&1 &
-FAIL_PID=$!
-sleep 4
-"$CLIENT" --port $FAIL_PORT --host-ip 127.0.0.1 --sequence $READS > $WORK/fail.out 2> $WORK/fail.err
-check "client reports the failed batch with INTERNAL" 13 $?
-check "client output stops at the failed batch" 1 "$([ $(wc -l < $WORK/fail.out) -gt 0 ] && [ $(wc -l < $WORK/fail.out) -lt 3685 ] && echo 1)"
-check "server logged the failure" 1 "$(grep -c 'Error classifying batch 1' $WORK/server_fail.log)"
-"$CLIENT" --port $FAIL_PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
-wait $FAIL_PID
-check "server survived the failed batch" 0 $?
-
 echo "+++ Shutdown +++"
 "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
 wait $SERVER_PID

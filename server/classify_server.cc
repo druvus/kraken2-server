@@ -1,5 +1,4 @@
 #include <condition_variable>
-#include <cstdlib>
 #include <map>
 #include <fstream>
 #include <getopt.h>
@@ -315,13 +314,6 @@ grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
 void Kraken2ServerClassifier::ProcessBatch(
     const Kraken2SequenceRequestMulti &reqs, uint64_t sequence,
     ThreadSafeQueue<BatchResults> &result_q) {
-
-    // Test hook: KRAKEN2_SERVER_FAIL_BATCH=<n> makes batch n of every
-    // stream fail, so that the error path can be exercised end to end.
-    static const char *fail_batch = getenv("KRAKEN2_SERVER_FAIL_BATCH");
-    if (fail_batch != nullptr && sequence == strtoull(fail_batch, nullptr, 10)) {
-        throw std::runtime_error("KRAKEN2_SERVER_FAIL_BATCH test hook");
-    }
 
     MinimizerScanner scanner(
         idx_opts.k, idx_opts.l, idx_opts.spaced_seed_mask,

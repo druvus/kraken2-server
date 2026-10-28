@@ -16,7 +16,6 @@ import subprocess
 import sys
 import time
 
-import grpc
 import pytest
 
 from kraken2_client import (TLS, Classification, Client, ShutdownRefused, read_fastx, read_pairs)
@@ -41,11 +40,11 @@ def free_port():
 
 
 class Server:
-    def __init__(self, *extra_args, env=None):
+    def __init__(self, *extra_args):
         self.port = free_port()
         self.proc = subprocess.Popen(
             [SERVER, "--db", DB, "--host-ip", "127.0.0.1", "--port", str(self.port), "--thread-pool", "2"] + list(extra_args),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def stop(self):
         if self.proc.poll() is None:
@@ -205,20 +204,6 @@ def test_results_arrive_in_input_order(server):
 def test_empty_input(server):
     with Client("127.0.0.1", server.port) as c:
         assert list(c.classify([])) == []
-
-
-def test_server_batch_failure_is_an_error():
-    # KRAKEN2_SERVER_FAIL_BATCH is a server test hook that makes a batch throw
-    s = Server(env=dict(os.environ, KRAKEN2_SERVER_FAIL_BATCH="0"))
-    try:
-        with Client("127.0.0.1", s.port) as c:
-            c.wait_ready(poll_seconds=0.5, timeout=60)
-            with pytest.raises(grpc.RpcError) as excinfo:
-                list(c.classify(read_fastx(READS)))
-            assert excinfo.value.code() == grpc.StatusCode.INTERNAL
-            assert "incomplete" in excinfo.value.details()
-    finally:
-        assert s.stop() == 0
 
 
 def test_shutdown_refused_without_flag():

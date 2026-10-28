@@ -291,8 +291,7 @@ version on small databases:
 * Illumina-style pairs and long reads built from the test reads by
   `testing/make_longread_testdata.py`: CASAVA and `/1` `/2` names, mates
   shorter than the k-mer size, reads up to 5 Mb, a batch over the gRPC
-  message limit, a server lost mid-stream, and a batch that fails on the
-  server;
+  message limit, and a server lost mid-stream;
 * a synthetic protein database built by `testing/make_protein_db.sh`:
   translated search, single-end and paired-end;
 * two synthetic nucleotide databases sharing a species, built by
