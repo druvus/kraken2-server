@@ -154,19 +154,30 @@ for i in $(seq 1 60); do
     "$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break
     sleep 1
 done
-timeout 90 "$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 --sequence $WORK/many.fq.gz > $WORK/lost.out 2> $WORK/lost.err &
+"$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 --sequence $WORK/many.fq.gz > $WORK/lost.out 2> $WORK/lost.err &
 LOST_CLIENT=$!
 # kill the server once the first results have arrived, while most of the
 # input is still unsent
 for i in $(seq 1 60); do
-    [ "$(wc -l < $WORK/lost.out)" -gt 0 ] && break
+    [ "$(wc -l < $WORK/lost.out | tr -d ' ')" -gt 0 ] && break
     sleep 1
 done
 kill -9 $LOST_PID
-wait $LOST_CLIENT
-LOST_RC=$?
-check "client had started receiving results" 1 "$([ $(wc -l < $WORK/lost.out) -gt 0 ] && echo 1)"
-check "client did not receive every result" 1 "$([ $(wc -l < $WORK/lost.out) -lt 110550 ] && echo 1)"
+# The client must exit on its own within 90 s. 124 marks a hang, as
+# timeout(1) would report it; timeout itself is not available on macOS.
+LOST_RC=124
+for i in $(seq 1 90); do
+    if ! kill -0 $LOST_CLIENT 2> /dev/null; then
+        wait $LOST_CLIENT
+        LOST_RC=$?
+        break
+    fi
+    sleep 1
+done
+[ $LOST_RC -eq 124 ] && kill -9 $LOST_CLIENT 2> /dev/null
+LOST_LINES=$(wc -l < $WORK/lost.out | tr -d ' ')
+check "client had started receiving results" 1 "$([ $LOST_LINES -gt 0 ] && echo 1)"
+check "client did not receive every result" 1 "$([ $LOST_LINES -lt 110550 ] && echo 1)"
 check "client exits with an error after losing the server (124 = hung)" 1 "$([ $LOST_RC -ne 0 ] && [ $LOST_RC -ne 124 ] && echo 1 || echo $LOST_RC)"
 
 echo "+++ Shutdown +++"
