@@ -30,10 +30,13 @@ __all__ = ["Client", "Classification", "Record", "PairedRecord", "read_fastx", "
 Record = Tuple[str, str, str]
 PairedRecord = Tuple[str, str, str, str, str]
 
-BATCH_SIZE = 2000        # at most this many records per gRPC message
-BATCH_BYTES = 32 * 1024 * 1024   # or this much sequence and quality data
-MAX_IN_FLIGHT = 64000    # records sent but not yet answered
-MAX_MESSAGE_BYTES = 128 * 1024 * 1024   # the server's message limit
+# Buffering is bounded in bytes as well as records so that long reads do not
+# make the client hold its whole input in memory.
+BATCH_SIZE = 2000                        # at most this many records per gRPC message
+BATCH_BYTES = 8 * 1024 * 1024            # or this much sequence and quality data
+MAX_IN_FLIGHT = 64000                    # records sent but not yet answered
+MAX_IN_FLIGHT_BYTES = 256 * 1024 * 1024  # bytes sent but not yet answered
+MAX_MESSAGE_BYTES = 128 * 1024 * 1024    # the server's message limit
 
 
 class ServerNotReady(RuntimeError):
@@ -78,6 +81,38 @@ def _read_pem(path: Optional[str]) -> Optional[bytes]:
         return None
     with open(path, "rb") as f:
         return f.read()
+
+
+class _InFlight:
+    """Records and bytes sent but not yet answered. The request generator
+    acquires room for each record (blocking on gRPC's thread while the
+    limits are exceeded) and the result loop releases records in order.
+    close() unblocks the generator when classify() exits early."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._sizes = []   # bytes of each record in flight, oldest first
+        self._bytes = 0
+        self._closed = False
+
+    def acquire(self, nbytes: int):
+        with self._cond:
+            while not self._closed and self._sizes and (
+                    len(self._sizes) >= MAX_IN_FLIGHT or self._bytes + nbytes > MAX_IN_FLIGHT_BYTES):
+                self._cond.wait(1.0)
+            self._sizes.append(nbytes)
+            self._bytes += nbytes
+
+    def release(self):
+        with self._cond:
+            if self._sizes:
+                self._bytes -= self._sizes.pop(0)
+            self._cond.notify_all()
+
+    def close(self):
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
 
 
 class Client:
@@ -158,11 +193,14 @@ class Client:
 
         Records are sent in messages of at most BATCH_SIZE records or
         BATCH_BYTES of sequence, so long reads never exceed the server's
-        message limit; a single record over that limit raises ValueError.
+        message limit, and at most MAX_IN_FLIGHT records or
+        MAX_IN_FLIGHT_BYTES are awaiting results, which bounds memory use
+        whatever the read length. A single record over the message limit
+        raises ValueError.
         An exception raised by the `records` iterable (for example from
         read_pairs on mismatched inputs) is re-raised after the results for
         the records already sent have been yielded."""
-        in_flight = threading.Semaphore(MAX_IN_FLIGHT)
+        in_flight = _InFlight()
         summary = []
         # An exception from the records iterable. It cannot propagate out
         # of the request generator, which gRPC runs on its own thread and
@@ -184,7 +222,7 @@ class Client:
                         yield batch
                         batch = pb.Kraken2SequenceRequestMulti()
                         batch_bytes = 0
-                    in_flight.acquire()
+                    in_flight.acquire(rec_bytes)
                     r = batch.seqs.add()
                     _fill(r, rec[0], rec[1], rec[2])
                     if len(rec) == 5:
@@ -195,14 +233,17 @@ class Client:
             if len(batch.seqs):
                 yield batch
 
-        for result in self._stub.ClassifyStream(requests()):
-            if result.HasField("classifications"):
-                for c in result.classifications.classes:
-                    in_flight.release()
-                    yield Classification(c.classified, c.id, c.tax_id, c.size, c.hitlist,
-                                         c.paired, c.size2)
-            elif result.HasField("summary"):
-                summary.append(result.summary)
+        try:
+            for result in self._stub.ClassifyStream(requests()):
+                if result.HasField("classifications"):
+                    for c in result.classifications.classes:
+                        in_flight.release()
+                        yield Classification(c.classified, c.id, c.tax_id, c.size, c.hitlist,
+                                             c.paired, c.size2)
+                elif result.HasField("summary"):
+                    summary.append(result.summary)
+        finally:
+            in_flight.close()
         if failure:
             raise failure[0]
         if report is not None:

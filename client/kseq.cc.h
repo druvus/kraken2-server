@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -28,13 +29,18 @@ public:
     bool failed() const { return m_last_status < -1; }
     // Read (at most) one sequence
     int read(Kraken2SequenceRequest&);
-    // read (up to) batch_size sequences
-    int read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size);
-    // read (up to) batch_size read pairs, one mate from this reader and one
-    // from mate_reader. Stops at the end of the shorter input; if the two
-    // inputs end at different points, mismatched is set to true.
+    // Read up to batch_size sequences, stopping early once the batch holds
+    // at least max_bytes of ids, sequence and quality data, so that a
+    // batch of long reads stays small. Returns the number read.
+    int read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size,
+             uint64_t max_bytes = UINT64_MAX);
+    // Read up to batch_size read pairs (or max_bytes, as for read), one
+    // mate from this reader and one from mate_reader. Stops at the end of
+    // the shorter input; if the two inputs end at different points,
+    // mismatched is set to true.
     int read_pairs(std::vector<Kraken2SequenceRequest> &seqs, int batch_size,
-                   FastReader &mate_reader, bool &mismatched);
+                   FastReader &mate_reader, bool &mismatched,
+                   uint64_t max_bytes = UINT64_MAX);
     // read all sequences
     int read_all(std::vector<Kraken2SequenceRequest> &seqs);
 private:

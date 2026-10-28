@@ -1,39 +1,45 @@
 name: Build and test
 
+# Pull requests and pushes to master. A pull request branch is tested once,
+# through its pull request, and a newer push to the same branch cancels the
+# run still going.
 on:
-  push:
-    branches: ["**"]
   pull_request:
+  push:
+    branches: [master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash -el {0}
 
 jobs:
-  build-test:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14]
-    defaults:
-      run:
-        shell: bash -el {0}
+  # Linux runs everything: build, unit tests, the kraken2 parity suite and
+  # the Python client tests.
+  linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Set up conda environment
-        uses: mamba-org/setup-micromamba@v1
+      - uses: mamba-org/setup-micromamba@v1
         with:
           environment-name: build
+          # libsystemd: current conda-forge libgrpc builds link against it
+          # without depending on it
           create-args: >-
             cmake
             make
             cxx-compiler
             libgrpc
             libprotobuf
+            libsystemd
             zlib
             doctest
-            llvm-openmp
             kraken2
             seqkit
             openssl
@@ -50,24 +56,16 @@ jobs:
               - conda-forge
               - bioconda
 
-      - name: Install libsystemd (needed by conda-forge libgrpc on Linux)
-        if: runner.os == 'Linux'
-        run: micromamba install -y -n build -c conda-forge libsystemd
-
-      - name: Configure
-        run: |
-          mkdir build && cd build
-          cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release \
-                -DBUILD_TESTS=ON -DBUILD_TEST_TOOLS=ON -DENABLE_WERROR=ON ..
-
       - name: Build
-        run: make -C build -j 4
+        run: |
+          cmake -S . -B build -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTS=ON -DBUILD_TEST_TOOLS=ON -DENABLE_WERROR=ON
+          make -C build -j 4
 
       - name: Unit tests
         run: ./build/tests/unit_tests
 
-      - name: Cache test database
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             testing/virus-zymo-kraken2
@@ -83,3 +81,40 @@ jobs:
           # environment's grpcio-tools, matching its grpcio
           pip install --no-build-isolation ./python
           pytest -q python/tests
+
+  # macOS checks that the sources build and the unit tests pass. The
+  # parity suite is Linux-only; macOS runners are scarce and the classifier
+  # code is the same.
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-name: build
+          create-args: >-
+            cmake
+            make
+            cxx-compiler
+            libgrpc
+            libprotobuf
+            zlib
+            doctest
+            llvm-openmp
+          init-shell: bash
+          cache-environment: true
+          condarc: |
+            channels:
+              - conda-forge
+
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTS=ON -DBUILD_TEST_TOOLS=ON -DENABLE_WERROR=ON
+          make -C build -j 4
+
+      - name: Unit tests
+        run: ./build/tests/unit_tests

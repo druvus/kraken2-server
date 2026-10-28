@@ -80,14 +80,22 @@ int FastReader::read(Kraken2SequenceRequest& rec) {
 }
 
 
-int FastReader::read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size)
+static uint64_t record_bytes(const Kraken2SequenceRequest &rec)
+{
+    return rec.id().size() + rec.seq().size() + rec.quals().size();
+}
+
+
+int FastReader::read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size,
+                     uint64_t max_bytes)
 {
     int rtn = 0;
-    seqs.reserve(batch_size);
-    for(int i=0; i<batch_size; ++i) {
+    uint64_t bytes = 0;
+    for(int i=0; i<batch_size && bytes < max_bytes; ++i) {
         Kraken2SequenceRequest rec;
         if (read(rec) >= 0) {
             rtn++;
+            bytes += record_bytes(rec);
             seqs.push_back(std::move(rec));
         }
         else {
@@ -99,15 +107,17 @@ int FastReader::read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size)
 
 
 int FastReader::read_pairs(std::vector<Kraken2SequenceRequest> &seqs, int batch_size,
-                           FastReader &mate_reader, bool &mismatched)
+                           FastReader &mate_reader, bool &mismatched,
+                           uint64_t max_bytes)
 {
     int rtn = 0;
-    seqs.reserve(batch_size);
-    for(int i=0; i<batch_size; ++i) {
+    uint64_t bytes = 0;
+    for(int i=0; i<batch_size && bytes < max_bytes; ++i) {
         Kraken2SequenceRequest rec, mate;
         bool got1 = read(rec) >= 0;
         bool got2 = mate_reader.read(mate) >= 0;
         if (got1 && got2) {
+            bytes += record_bytes(rec) + record_bytes(mate);
             rec.mutable_mate()->Swap(&mate);
             rtn++;
             seqs.push_back(std::move(rec));
