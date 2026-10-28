@@ -56,8 +56,10 @@ kraken2_client --port 8080 --sequence <reads_1.fq.gz> --sequence2 <reads_2.fq.gz
 
 The two files must list mates in the same order. If they contain different
 numbers of reads, only complete pairs are classified and the client exits
-with status 65. Pairing is decided per read, so one server serves
-single-end and paired-end clients at the same time.
+with status 65. Mates are paired by position; their names are not compared,
+as with `kraken2 --paired`, and interleaved pairs in one file are not
+supported. Pairing is decided per read, so one server serves single-end and
+paired-end clients at the same time.
 
 Without `--sequence` the client prints the server's cumulative report over
 every read it has classified since it started (unless the server runs with
@@ -117,8 +119,12 @@ is accepted for compatibility; protein databases are detected from `opts.k2d`.
 
 Exit status is 0 on success, 64 for a usage error, 65 for mismatched
 paired-end inputs, 69 when the server cannot be reached, 74 when an input
-file cannot be read or parsed, or the gRPC status code of a failed request.
-A client started while the server is still loading its database waits.
+file cannot be read or parsed, 76 when the server completed the stream
+with fewer results than reads sent, or the gRPC status code of a failed
+request: 13 when the server could not classify a batch, 14 when the
+server went away during the stream. In every failure the lines already
+printed are complete results in input order. A client started while the
+server is still loading its database waits.
 
 ### Memory and threads
 
@@ -128,6 +134,13 @@ processes using the same database (for example the `kraken2` program) and
 a large database starts serving before it is fully paged in. Each stream
 buffers at most twice the thread count in request batches, so a fast
 client cannot make the server hold its whole input in memory.
+
+The clients bound their buffering in bytes as well as reads, so memory use
+does not grow with read length or input size: request messages hold at
+most 2000 reads or 8 MB of sequence, the C++ client reads at most 16 such
+batches ahead, and both clients keep at most 256 MB (or 64,000 reads)
+sent and not yet answered. On a 1.5 GB nanopore input the C++ client peaks
+below 200 MB and the Python client near 100 MB.
 
 ## Several databases
 
@@ -215,6 +228,7 @@ packages, which is also what the conda recipe in `conda/` and the CI use:
 ```
 mamba create -n k2build -c conda-forge cmake libgrpc libprotobuf zlib llvm-openmp cxx-compiler make
 mamba activate k2build
+# on Linux, current conda-forge libgrpc builds also need: mamba install libsystemd
 mkdir build && cd build
 cmake -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_BUILD_TYPE=Release ..
 make -j 8
@@ -274,6 +288,11 @@ version on small databases:
 
 * the virus-zymo nucleotide test database (downloaded on first use):
   single-end, paired-end, mismatched pairs, empty input, output order;
+* Illumina-style pairs and long reads built from the test reads by
+  `testing/make_longread_testdata.py`: CASAVA and `/1` `/2` names, mates
+  shorter than the k-mer size, reads up to 5 Mb, a batch over the gRPC
+  message limit, a server lost mid-stream, and a batch that fails on the
+  server;
 * a synthetic protein database built by `testing/make_protein_db.sh`:
   translated search, single-end and paired-end;
 * two synthetic nucleotide databases sharing a species, built by

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kraken2-client"
-version = "0.2.0"
+version = "0.2.1"
 description = "Python client for kraken2_server, a gRPC server around the Kraken 2 classifier"
 readme = "README.md"
 requires-python = ">=3.9"

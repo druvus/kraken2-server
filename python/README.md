@@ -52,7 +52,15 @@ client = Client("server.example.org", 8080, TLS(ca="ca.pem"))
 `classify()` accepts any iterable of `(id, seq, quals)` or
 `(id, seq, quals, mate_seq, mate_quals)` tuples, so reads can come from a
 running sequencer as easily as from a file. Results are yielded in input
-order while the stream is still being sent.
+order while the stream is still being sent. Records are sent in messages
+of at most 2000 records or 8 MB, and at most 256 MB (or 64,000 records)
+are awaiting results, so memory use is bounded whatever the read length.
+An exception raised by the iterable, such as the `ValueError` from
+`read_pairs` on inputs of different lengths, is raised by `classify()`
+after the results for the records already sent have been yielded. A
+`grpc.RpcError` with status `INTERNAL` means the server could not
+classify a batch and the results are incomplete; `UNAVAILABLE` means the
+server went away.
 
 ## Tests
 
