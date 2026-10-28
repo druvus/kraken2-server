@@ -149,14 +149,24 @@ for i in $(seq 1 30); do cat $READS; done > $WORK/many.fq.gz
 LOST_PORT=$((PORT + 1))
 "$SERVER" --db $DB --host-ip 127.0.0.1 --port $LOST_PORT --thread-pool 1 > $WORK/server_lost.log 2>&1 &
 LOST_PID=$!
-sleep 4
-timeout 60 "$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 --sequence $WORK/many.fq.gz > $WORK/lost.out 2> $WORK/lost.err &
+# wait until the database is loaded (the summary request fails until then)
+for i in $(seq 1 60); do
+    "$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break
+    sleep 1
+done
+timeout 90 "$CLIENT" --port $LOST_PORT --host-ip 127.0.0.1 --sequence $WORK/many.fq.gz > $WORK/lost.out 2> $WORK/lost.err &
 LOST_CLIENT=$!
-sleep 5
+# kill the server once the first results have arrived, while most of the
+# input is still unsent
+for i in $(seq 1 60); do
+    [ "$(wc -l < $WORK/lost.out)" -gt 0 ] && break
+    sleep 1
+done
 kill -9 $LOST_PID
 wait $LOST_CLIENT
 LOST_RC=$?
 check "client had started receiving results" 1 "$([ $(wc -l < $WORK/lost.out) -gt 0 ] && echo 1)"
+check "client did not receive every result" 1 "$([ $(wc -l < $WORK/lost.out) -lt 110550 ] && echo 1)"
 check "client exits with an error after losing the server (124 = hung)" 1 "$([ $LOST_RC -ne 0 ] && [ $LOST_RC -ne 124 ] && echo 1 || echo $LOST_RC)"
 
 echo "+++ Shutdown +++"
