@@ -262,6 +262,17 @@ gzip -dc $READS | head -c 5000000 > $WORK/truncated.fq
 "$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $WORK/truncated.fq > $WORK/truncated.out 2> /dev/null
 check "plain FASTQ cut mid-record exits with EX_IOERR" 74 $?
 check "complete records before the cut are classified" "$(gzip -dc $READS | head -c 5000000 | grep -c '^+$')" "$(wc -l < $WORK/truncated.out | tr -d ' ')"
+# The client decodes gzip itself: concatenated members, gzip on stdin, and
+# a gzip file cut short.
+cat $READS $READS > $WORK/concat.fq.gz
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $WORK/concat.fq.gz > $WORK/concat.out 2> /dev/null
+check "concatenated gzip members exit code" 0 $?
+check "concatenated gzip members are all read" "$(cat $WORK/ref_single.out $WORK/ref_single.out | md5sum)" "$(md5sum < $WORK/concat.out)"
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence - < $READS > $WORK/gzstdin.out 2> /dev/null
+check "gzip on stdin identical to kraken2" 0 "$(diff $WORK/gzstdin.out $WORK/ref_single.out | grep -c '^[<>]')"
+head -c 3000000 $READS > $WORK/cut.fq.gz
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $WORK/cut.fq.gz > /dev/null 2>&1
+check "truncated gzip file exits with EX_IOERR" 74 $?
 python3 -c "
 import sys
 with open(sys.argv[1], 'w') as f:
@@ -287,6 +298,41 @@ for i in $(seq 1 15); do
 done
 [ $QUIET_RC -eq 124 ] && kill $QUIET_CLIENT 2> /dev/null
 check "client on a quiet pipe exits UNAVAILABLE when the server dies (124 = still waiting)" 14 $QUIET_RC
+
+# A client fed slowly, as by a running sequencer, gets results within
+# about a second of each read rather than after a full batch, and a client
+# whose server stops answering gives up after its keepalive timeout.
+echo "+++ Live streaming +++"
+LIVE_PORT=$((PORT + 7))
+"$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $LIVE_PORT > $WORK/server_live.log 2>&1 &
+SERVER_PID=$!
+trap 'kill -CONT $SERVER_PID 2> /dev/null; kill $SERVER_PID 2> /dev/null' EXIT
+for i in $(seq 1 60); do "$CLIENT" --port $LIVE_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break; sleep 1; done
+gzip -dc $READS | head -40 > $WORK/ten.fq
+( for i in $(seq 0 9); do sed -n "$((i * 4 + 1)),$((i * 4 + 4))p" $WORK/ten.fq; sleep 1; done ) \
+    | "$CLIENT" --port $LIVE_PORT --host-ip 127.0.0.1 --sequence - > $WORK/live.out 2> $WORK/live.err &
+LIVE_CLIENT=$!
+sleep 3
+check "first result within 3 s of reads arriving one per second" 1 "$([ $(wc -l < $WORK/live.out) -gt 0 ] && echo 1)"
+wait $LIVE_CLIENT
+check "slow stdin client exit code" 0 $?
+check "slow stdin client classified every read" 10 "$(wc -l < $WORK/live.out | tr -d ' ')"
+( gzip -dc $READS | head -4; sleep 120 ) \
+    | "$CLIENT" --port $LIVE_PORT --host-ip 127.0.0.1 --keepalive 10 --sequence - > /dev/null 2> $WORK/keepalive.err &
+KEEP_CLIENT=$!
+sleep 3
+kill -STOP $SERVER_PID
+KEEP_RC=124
+for i in $(seq 1 45); do
+    if ! kill -0 $KEEP_CLIENT 2> /dev/null; then wait $KEEP_CLIENT; KEEP_RC=$?; break; fi
+    sleep 1
+done
+[ $KEEP_RC -eq 124 ] && kill $KEEP_CLIENT 2> /dev/null
+check "client gives up on a frozen server within its keepalive (124 = still waiting)" 14 $KEEP_RC
+kill -CONT $SERVER_PID
+"$CLIENT" --port $LIVE_PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+wait $SERVER_PID
+trap - EXIT
 
 # Translated search against a tiny synthetic protein database, built on
 # first use by make_protein_db.sh (needs kraken2-build and python3).

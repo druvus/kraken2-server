@@ -36,6 +36,10 @@ public:
     // batch of long reads stays small. Returns the number read.
     int read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size,
              uint64_t max_bytes = UINT64_MAX);
+    // Read one read pair, one mate from this reader and one from
+    // mate_reader. Returns 1 for a pair and 0 at the end of either input;
+    // if the inputs end at different points, mismatched is set to true.
+    int read_pair(Kraken2SequenceRequest &rec, FastReader &mate_reader, bool &mismatched);
     // Read up to batch_size read pairs (or max_bytes, as for read), one
     // mate from this reader and one from mate_reader. Stops at the end of
     // the shorter input; if the two inputs end at different points,

@@ -16,8 +16,10 @@ order the records were sent.
 import collections
 import gzip
 import io
+import os
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional, Tuple, Union
 
@@ -39,6 +41,13 @@ BATCH_BYTES = 8 * 1024 * 1024            # or this much sequence and quality dat
 MAX_IN_FLIGHT = 64000                    # records sent but not yet answered
 MAX_IN_FLIGHT_BYTES = 256 * 1024 * 1024  # bytes sent but not yet answered
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024    # the server's message limit
+FLUSH_SECONDS = 1.0     # send a partial batch once its first record is this old
+FEED_CHUNK = 512                        # records handed between threads at once
+FEED_CHUNK_BYTES = 8 * 1024 * 1024      # or this much sequence
+FEED_AHEAD = 8                          # chunks read ahead of the request generator
+KEEPALIVE_TIMEOUT_MS = 20000   # a keepalive ping unanswered this long ends the stream
+
+_END = object()
 
 
 class ServerNotReady(RuntimeError):
@@ -122,11 +131,99 @@ class _InFlight:
             self._cond.notify_all()
 
 
+class _Feed:
+    """Records handed from the thread that reads the caller's iterable to
+    gRPC's request generator, in chunks so that the two threads meet once
+    per FEED_CHUNK records rather than once per record. The reader adds
+    records to a pending chunk and queues it when full; the generator takes
+    queued chunks, and the pending chunk too once nothing has been queued
+    for its timeout, so records that arrive slowly are not held back.
+    At most FEED_AHEAD chunks wait to be taken."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pending = []
+        self.pending_bytes = 0
+        self.chunks = collections.deque()
+        self.ready = threading.Event()   # a chunk was queued for a waiting generator
+        self.space = threading.Event()   # a chunk was taken for a waiting reader
+        self.consumer_waiting = False
+        self.producer_waiting = False
+        self.stop = threading.Event()
+
+    def put(self, item, nbytes: int) -> bool:
+        """Add one item. False once the feed has been stopped."""
+        with self.lock:
+            self.pending.append(item)
+            self.pending_bytes += nbytes
+            if len(self.pending) < FEED_CHUNK and self.pending_bytes < FEED_CHUNK_BYTES:
+                return not self.stop.is_set()
+            chunk, self.pending, self.pending_bytes = self.pending, [], 0
+        return self._queue(chunk)
+
+    def close(self):
+        """Queue whatever is pending; the reader calls this at the end."""
+        with self.lock:
+            chunk, self.pending, self.pending_bytes = self.pending, [], 0
+        if chunk:
+            self._queue(chunk)
+
+    def _queue(self, chunk) -> bool:
+        while len(self.chunks) >= FEED_AHEAD and not self.stop.is_set():
+            self.producer_waiting = True
+            self.space.clear()
+            if len(self.chunks) >= FEED_AHEAD:
+                self.space.wait(0.5)
+            self.producer_waiting = False
+        if self.stop.is_set():
+            return False
+        self.chunks.append(chunk)
+        if self.consumer_waiting:
+            self.ready.set()
+        return True
+
+    def get(self, timeout: float):
+        """The next chunk of items, or None if nothing arrived in time."""
+        if not self.chunks:
+            self.consumer_waiting = True
+            self.ready.clear()
+            if not self.chunks:
+                self.ready.wait(timeout)
+            self.consumer_waiting = False
+        with self.lock:
+            # A queued chunk is always older than the pending one: the
+            # reader queues a full chunk before it adds the next item.
+            if self.chunks:
+                chunk = self.chunks.popleft()
+            elif self.pending:
+                chunk, self.pending, self.pending_bytes = self.pending, [], 0
+            else:
+                return None
+        if self.producer_waiting:
+            self.space.set()
+        return chunk
+
+
 class Client:
-    def __init__(self, host: str = "localhost", port: int = 8080, tls: Optional[TLS] = None):
+    def __init__(self, host: str = "localhost", port: int = 8080, tls: Optional[TLS] = None,
+                 keepalive: int = 60):
+        """keepalive: seconds without data on a stream before the client
+        pings the server; a ping unanswered for 20 s ends the stream with
+        UNAVAILABLE, so a frozen server or a network that drops without a
+        reset is noticed. At least 10 (the server refuses pings more often);
+        0 disables."""
+        if keepalive and keepalive < 10:
+            raise ValueError("keepalive must be 0 or at least 10 seconds")
         target = "%s:%d" % (host, port)
         options = [("grpc.max_receive_message_length", -1),
                    ("grpc.max_send_message_length", MAX_MESSAGE_BYTES)]
+        if keepalive:
+            options += [("grpc.keepalive_time_ms", keepalive * 1000),
+                        ("grpc.keepalive_timeout_ms", KEEPALIVE_TIMEOUT_MS),
+                        # current gRPC times keepalive pings out with this
+                        ("grpc.http2.ping_timeout_ms", KEEPALIVE_TIMEOUT_MS),
+                        ("grpc.keepalive_permit_without_calls", 0),
+                        ("grpc.http2.max_pings_without_data", 0)]
         if tls is None:
             self._channel = grpc.insecure_channel(target, options=options)
         else:
@@ -203,7 +300,12 @@ class Client:
         message limit, and at most MAX_IN_FLIGHT records or
         MAX_IN_FLIGHT_BYTES are awaiting results, which bounds memory use
         whatever the read length. A single record over the message limit
-        raises ValueError.
+        raises ValueError. An iterable that may block (stdin, a pipe, any
+        iterable other than read_fastx or read_pairs on regular files) is
+        read on a separate thread, and a partial message is sent once its
+        first record is FLUSH_SECONDS old, so records that arrive slowly
+        (from a running sequencer) are classified as they come rather than
+        once a message is full.
         An exception raised by the `records` iterable (for example from
         read_pairs on mismatched inputs) is re-raised after the results for
         the records already sent have been yielded."""
@@ -215,28 +317,83 @@ class Client:
         # raised once the stream has been drained.
         failure = []
 
-        def requests():
-            batch = pb.Kraken2SequenceRequestMulti()
-            batch_bytes = 0
+        # An iterable that may block (stdin, a pipe, a generator fed by a
+        # running sequencer) is read on its own thread, so that the request
+        # generator can send a partial message while it blocks. Records
+        # read from a regular file by read_fastx or read_pairs cannot
+        # block, and are read directly, which is faster.
+        feed = _Feed()
+        stop = feed.stop
+        may_block = getattr(records, "may_block", True)
+
+        def feeder():
             try:
                 for rec in records:
-                    rec_bytes = _record_bytes(rec)
-                    if rec_bytes > MAX_MESSAGE_BYTES:
-                        raise ValueError("record %s is larger than the %d MB message limit"
-                                         % (rec[0], MAX_MESSAGE_BYTES // (1024 * 1024)))
-                    if len(batch.seqs) and (len(batch.seqs) >= BATCH_SIZE
-                                            or batch_bytes + rec_bytes > BATCH_BYTES):
-                        yield batch
-                        batch = pb.Kraken2SequenceRequestMulti()
-                        batch_bytes = 0
-                    in_flight.acquire(rec_bytes)
-                    r = batch.seqs.add()
-                    _fill(r, rec[0], rec[1], rec[2])
-                    if len(rec) == 5:
-                        _fill(r.mate, rec[0], rec[3], rec[4])
-                    batch_bytes += rec_bytes
+                    if not feed.put(rec, _record_bytes(rec)):
+                        return
             except Exception as e:  # noqa: BLE001 - re-raised by classify()
                 failure.append(e)
+            feed.put(_END, 0)
+            feed.close()
+
+        if may_block:
+            threading.Thread(target=feeder, name="kraken2-client-feeder", daemon=True).start()
+
+        def records_from_feed():
+            # yields records, or None when nothing arrived before the
+            # current batch is due (the generator then sends it)
+            while True:
+                if len(state["batch"].seqs):
+                    timeout = max(0.0, state["started"] + FLUSH_SECONDS - time.monotonic())
+                else:
+                    timeout = 0.5
+                chunk = feed.get(timeout)
+                if chunk is None:
+                    if stop.is_set():
+                        return
+                    yield None
+                    continue
+                for rec in chunk:
+                    if rec is _END:
+                        return
+                    yield rec
+
+        def records_direct():
+            try:
+                yield from records
+            except Exception as e:  # noqa: BLE001 - re-raised by classify()
+                failure.append(e)
+
+        state = {"batch": pb.Kraken2SequenceRequestMulti(), "started": 0.0}
+
+        def requests():
+            batch = state["batch"]
+            batch_bytes = 0
+            for rec in (records_from_feed() if may_block else records_direct()):
+                if rec is None:
+                    if len(batch.seqs):
+                        yield batch
+                        batch = state["batch"] = pb.Kraken2SequenceRequestMulti()
+                        batch_bytes = 0
+                    continue
+                rec_bytes = _record_bytes(rec)
+                if rec_bytes > MAX_MESSAGE_BYTES:
+                    failure.append(ValueError("record %s is larger than the %d MB message limit"
+                                              % (rec[0], MAX_MESSAGE_BYTES // (1024 * 1024))))
+                    break
+                if len(batch.seqs) and (len(batch.seqs) >= BATCH_SIZE
+                                        or batch_bytes + rec_bytes > BATCH_BYTES):
+                    yield batch
+                    batch = state["batch"] = pb.Kraken2SequenceRequestMulti()
+                    batch_bytes = 0
+                in_flight.acquire(rec_bytes)
+                if not len(batch.seqs):
+                    state["started"] = time.monotonic()
+                r = batch.seqs.add()
+                _fill(r, rec[0], rec[1], rec[2])
+                if len(rec) == 5:
+                    _fill(r.mate, rec[0], rec[3], rec[4])
+                batch_bytes += rec_bytes
             if len(batch.seqs):
                 yield batch
 
@@ -250,6 +407,7 @@ class Client:
                 elif result.HasField("summary"):
                     summary.append(result.summary)
         finally:
+            stop.set()
             in_flight.close()
         # The report covers the records that were classified, also when
         # the record source failed part way.
@@ -289,6 +447,21 @@ def _open_text(path: str):
     return io.TextIOWrapper(f)
 
 
+class _Records:
+    """An iterator of records that also says whether reading it may block
+    for a long time (stdin or a pipe), as opposed to a regular file."""
+
+    def __init__(self, it, may_block: bool):
+        self._it = it
+        self.may_block = may_block
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+
 def read_fastx(path: str) -> Iterator[Record]:
     """Return an iterator of (id, seq, quals) from a FASTA or FASTQ file,
     plain or gzipped, or from stdin when path is "-". The id is the header
@@ -299,7 +472,8 @@ def read_fastx(path: str) -> Iterator[Record]:
     (a truncated file) or a truncated gzip file raises InputError when it
     is reached. Standard input is left open."""
     f = _open_text(path)
-    return _fastx_records(f, path, close=f is not sys.stdin)
+    may_block = path == "-" or not os.path.isfile(path)
+    return _Records(_fastx_records(f, path, close=f is not sys.stdin), may_block)
 
 
 def _fastx_records(f, path: str, close: bool) -> Iterator[Record]:
@@ -342,7 +516,7 @@ def read_pairs(path1: str, path2: str) -> Iterator[PairedRecord]:
     shorter file and raises ValueError if the lengths differ."""
     it1 = read_fastx(path1)
     it2 = read_fastx(path2)
-    return _pairs(it1, it2, path1, path2)
+    return _Records(_pairs(it1, it2, path1, path2), it1.may_block or it2.may_block)
 
 
 def _pairs(it1, it2, path1: str, path2: str) -> Iterator[PairedRecord]:

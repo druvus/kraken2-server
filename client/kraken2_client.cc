@@ -63,7 +63,14 @@ struct Options
     std::string tls_cert;
     std::string tls_key;
     std::string tls_server_name;  // expected certificate name when it differs from the host
+    // Ping the server after this many seconds without data on a stream and
+    // give up when no answer comes within KEEPALIVE_TIMEOUT_MS; 0 disables.
+    int keepalive = 60;
 };
+
+// How long a ping to the server may go unanswered before the client gives
+// up on the connection.
+#define KEEPALIVE_TIMEOUT_MS 20000
 
 typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequestMulti, Kraken2SequenceStreamResult>> ClientStream;
 
@@ -80,6 +87,61 @@ typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequestMulti, Kraken2S
 #define FASTQ_BATCH_SIZE 4000                         // reads in a file batch
 #define FASTQ_BATCH_BYTES (8ULL * 1024 * 1024)        // bytes in a file batch
 #define MAX_BATCHES 16                                // file batches buffered ahead of the writer
+// Reads that arrive slowly (a pipe fed by a running sequencer) are sent
+// once nothing else has arrived for this long, rather than when a file
+// batch is full.
+#define FLUSH_INTERVAL 1s
+
+// Reads that do not yet fill a file batch. The file reader adds to it and
+// hands it to the batch queue once full; the writer takes it when the
+// queue has been empty for FLUSH_INTERVAL.
+struct PendingReads {
+    std::mutex mtx;
+    std::vector<Kraken2SequenceRequest> reads;
+    uint64_t bytes = 0;
+
+    // Add a read; returns the full batch to queue, or an empty vector.
+    std::vector<Kraken2SequenceRequest> add(Kraken2SequenceRequest &&rec, uint64_t rec_bytes) {
+        std::lock_guard<std::mutex> lock(mtx);
+        reads.push_back(std::move(rec));
+        bytes += rec_bytes;
+        if (reads.size() >= FASTQ_BATCH_SIZE || bytes >= FASTQ_BATCH_BYTES) {
+            return take_locked();
+        }
+        return {};
+    }
+    std::vector<Kraken2SequenceRequest> take() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return take_locked();
+    }
+    // The next batch for the writer after the queue stayed empty: a batch
+    // queued meanwhile comes first (the file reader queues a full batch
+    // before it adds the next read here, so a non-empty pending batch is
+    // always later than anything in the queue), else the pending reads.
+    std::vector<Kraken2SequenceRequest> take_after(
+            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &queue) {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (std::optional<std::vector<Kraken2SequenceRequest>> queued = queue.pop()) {
+            return std::move(*queued);
+        }
+        return take_locked();
+    }
+private:
+    std::vector<Kraken2SequenceRequest> take_locked() {
+        std::vector<Kraken2SequenceRequest> out;
+        out.swap(reads);
+        bytes = 0;
+        return out;
+    }
+};
+
+static uint64_t RecordBytes(const Kraken2SequenceRequest &rec) {
+    uint64_t n = rec.id().size() + rec.seq().size() + rec.quals().size();
+    if (rec.has_mate()) {
+        n += rec.mate().seq().size() + rec.mate().quals().size();
+    }
+    return n;
+}
 
 // Reads and bytes sent and not yet answered. The writer adds a message
 // just before sending it (so its first result cannot arrive before it is
@@ -193,16 +255,17 @@ public:
         // gRPC writer. The reader blocks when MAX_BATCHES are buffered and
         // closes the queue when the input is exhausted.
         ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> batches_queue(MAX_BATCHES);
+        PendingReads pending;
 
         // reads data from file into queue
         std::future<int> fastq_batches = std::async(
             std::launch::async, &SequenceClient::FastBatcher, this,
-            reader.get(), mate_reader.get(), std::ref(batches_queue));
+            reader.get(), mate_reader.get(), std::ref(batches_queue), std::ref(pending));
 
         // take data from queue and send over gRPC
         std::future<int> stream_batches = std::async(
             std::launch::async, &SequenceClient::StreamWriter, this,
-            std::ref(in_flight), std::ref(batches_queue), std::ref(stream));
+            std::ref(in_flight), std::ref(batches_queue), std::ref(pending), std::ref(stream));
 
         // reading back results on gRPC stream
         std::future<int> recv_reads = std::async(
@@ -331,13 +394,28 @@ public:
     int StreamWriter(
             InFlight &in_flight,
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches,
+            PendingReads &pending,
             ClientStream &writer) {
         int seqs_sent = 0;
         try {
-            // pop_wait returns an empty optional once the reader has closed
-            // the queue and every batch has been taken.
-            while (std::optional<std::vector<Kraken2SequenceRequest>> item = batches.pop_wait()) {
-                std::vector<Kraken2SequenceRequest> batch = std::move(*item);
+            while (true) {
+                std::vector<Kraken2SequenceRequest> batch;
+                if (std::optional<std::vector<Kraken2SequenceRequest>> item =
+                        batches.pop_wait_for(FLUSH_INTERVAL)) {
+                    batch = std::move(*item);
+                }
+                else if (batches.drained()) {
+                    // the file reader has queued everything and finished
+                    break;
+                }
+                else {
+                    // nothing arrived for FLUSH_INTERVAL: send what the
+                    // file reader holds so far
+                    batch = pending.take_after(batches);
+                    if (batch.empty()) {
+                        continue;
+                    }
+                }
 
                 // rebatch to smaller batches for stream, moving each read
                 // into the message rather than copying it. File batches are
@@ -413,6 +491,9 @@ public:
                         PrintClassification(res);
                         in_flight.retire_one();
                     }
+                    // one flush per result message, so results reach a
+                    // file or pipe as they arrive
+                    std::cout.flush();
                 }
                 else if (result.has_summary()) {
                     PrintSummary(result.summary(), report_file);
@@ -444,7 +525,8 @@ public:
     int FastBatcher(
             FastReader *reader_ptr,
             FastReader *mate_reader,
-            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches_queue) {
+            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches_queue,
+            PendingReads &pending) {
         int n_batches = 0;
         const bool paired = mate_reader != nullptr;
         FastReader &reader = *reader_ptr;
@@ -463,28 +545,34 @@ public:
                 std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
             }
             bool mismatched = false;
+            bool stopped = false;
+            // One read (or pair) at a time into the pending batch, which is
+            // queued when full; the writer also takes it when reads arrive
+            // slowly.
             while (true) {
-                std::vector<Kraken2SequenceRequest> seqs;
-                int n_reads;
-                if (paired) {
-                    n_reads = reader.read_pairs(seqs, FASTQ_BATCH_SIZE, *mate_reader, mismatched,
-                                                FASTQ_BATCH_BYTES);
+                Kraken2SequenceRequest rec;
+                bool got = paired ? reader.read_pair(rec, *mate_reader, mismatched) > 0
+                                  : reader.read(rec) >= 0;
+                if (!got) {
+                    break;
                 }
-                else {
-                    n_reads = reader.read(seqs, FASTQ_BATCH_SIZE, FASTQ_BATCH_BYTES);
-                }
-                if (n_reads > 0) {
+                uint64_t rec_bytes = RecordBytes(rec);
+                std::vector<Kraken2SequenceRequest> full = pending.add(std::move(rec), rec_bytes);
+                if (!full.empty()) {
                     n_batches++;
                     // blocks while MAX_BATCHES are already buffered; false
-                    // once the writer has closed the queue after a failure
-                    if (!batches_queue.push(std::move(seqs))) {
+                    // once the queue has been closed after a failure
+                    if (!batches_queue.push(std::move(full))) {
+                        stopped = true;
                         break;
                     }
                 }
-                // A batch ends early at the byte budget; the input is done
-                // when a reader has hit the end of its file or an error.
-                if (reader.last_status() < 0 || (paired && mate_reader->last_status() < 0)) {
-                    break;
+            }
+            if (!stopped) {
+                std::vector<Kraken2SequenceRequest> rest = pending.take();
+                if (!rest.empty()) {
+                    n_batches++;
+                    batches_queue.push(std::move(rest));
                 }
             }
             if (mismatched) {
@@ -620,6 +708,13 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
         [&](const std::string &v) { opts.report_file = v; }});
     parser.add({"host-ip", 'i', true, "[addr]", "Server IP address (default: localhost)",
         [&](const std::string &v) { opts.host = v; }});
+    parser.add({"keepalive", 0, true, "[seconds]", "Ping the server after this long without data and give up if it does not answer within 20 s; 0 disables (default: 60, minimum 10)",
+        [&](const std::string &v) {
+            opts.keepalive = Parser::ParseInt(v, "--keepalive", 0, 86400);
+            if (opts.keepalive != 0 && opts.keepalive < 10) {
+                throw std::invalid_argument("--keepalive must be 0 or at least 10 seconds, got '" + v + "'");
+            }
+        }});
     parser.add({"port", 'p', true, "[int]", "Server port (default: 8080)",
         [&](const std::string &v) { opts.port = Parser::ParseInt(v, "--port", 0, 65535); }});
     parser.add({"shutdown", 'k', false, "", "Shutdown server",
@@ -669,6 +764,19 @@ int main(int argc, char **argv) {
     // default 4MB message size. Just set it to the max
     grpc::ChannelArguments ch_args;
     ch_args.SetMaxReceiveMessageSize(INT_MAX);
+    if (opts.keepalive > 0) {
+        // Detect a server that stops answering (frozen, or a network that
+        // drops without a reset) during a stream. The server accepts pings
+        // every 10 s or more without data.
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, opts.keepalive * 1000);
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, KEEPALIVE_TIMEOUT_MS);
+        // Current gRPC times a keepalive ping out with the general HTTP/2
+        // ping timeout (60 s by default, no public macro) rather than the
+        // keepalive timeout.
+        ch_args.SetInt("grpc.http2.ping_timeout_ms", KEEPALIVE_TIMEOUT_MS);
+        ch_args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 0);
+        ch_args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+    }
     std::shared_ptr<grpc::ChannelCredentials> credentials;
     if (opts.tls) {
         grpc::SslCredentialsOptions ssl_opts;

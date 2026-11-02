@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -5,21 +6,124 @@
 #include <stdexcept>
 #include <string>
 
+#include <fcntl.h>
+#include <unistd.h>
 #include <zlib.h>
 #include "kseq.h"
 #include "kseq.cc.h"
 
-KSEQ_INIT(gzFile, gzread)
+// Input under kseq. zlib's gzread fills its whole buffer before it
+// returns, so reading a pipe through it, records written slowly (by a
+// running sequencer, say) are only seen once tens of kilobytes have
+// arrived or the pipe closes. Here plain input returns whatever one read()
+// delivers, and gzip input, any number of concatenated members, is decoded
+// with inflate as it arrives. The format is decided from the first two
+// bytes, on the first read.
+struct Input
+{
+    int fd = -1;
+    bool close_fd = false;
+    bool detected = false;
+    bool gzip = false;
+    bool in_member = false;   // part way through a gzip member
+    z_stream zs;
+    unsigned char buf[65536];
+    size_t pos = 0, len = 0;  // raw bytes read but not yet consumed
+
+    ~Input()
+    {
+        if (gzip) inflateEnd(&zs);
+        if (close_fd && fd >= 0) ::close(fd);
+    }
+};
+
+static ssize_t raw_read(int fd, void *p, size_t n)
+{
+    ssize_t r;
+    do {
+        r = ::read(fd, p, n);
+    } while (r < 0 && errno == EINTR);
+    return r;
+}
+
+// kseq's read function: up to out_len bytes of text, 0 at the end of the
+// input, -1 on an error, a corrupt gzip stream or a truncated gzip member.
+static int input_read(Input *in, void *out, unsigned out_len)
+{
+    if (!in->detected) {
+        in->detected = true;
+        while (in->len < 2) {
+            ssize_t r = raw_read(in->fd, in->buf + in->len, sizeof(in->buf) - in->len);
+            if (r < 0) return -1;
+            if (r == 0) break;
+            in->len += r;
+        }
+        if (in->len >= 2 && in->buf[0] == 0x1f && in->buf[1] == 0x8b) {
+            memset(&in->zs, 0, sizeof(in->zs));
+            if (inflateInit2(&in->zs, 15 + 16) != Z_OK) return -1;
+            in->gzip = true;
+        }
+    }
+
+    if (!in->gzip) {
+        if (in->pos < in->len) {
+            size_t n = std::min<size_t>(out_len, in->len - in->pos);
+            memcpy(out, in->buf + in->pos, n);
+            in->pos += n;
+            return (int) n;
+        }
+        ssize_t r = raw_read(in->fd, out, out_len);
+        return r < 0 ? -1 : (int) r;
+    }
+
+    in->zs.next_out = (Bytef *) out;
+    in->zs.avail_out = out_len;
+    while (in->zs.avail_out == out_len) {
+        if (in->zs.avail_in == 0) {
+            if (in->pos >= in->len) {
+                ssize_t r = raw_read(in->fd, in->buf, sizeof(in->buf));
+                if (r < 0) return -1;
+                if (r == 0) {
+                    // the input ended; inside a member means it was cut short
+                    return in->in_member ? -1 : 0;
+                }
+                in->pos = 0;
+                in->len = r;
+            }
+            in->zs.next_in = in->buf + in->pos;
+            in->zs.avail_in = in->len - in->pos;
+            in->pos = in->len;
+        }
+        int ret = inflate(&in->zs, Z_NO_FLUSH);
+        if (ret == Z_STREAM_END) {
+            in->in_member = false;
+            inflateReset(&in->zs);  // another member may follow
+        }
+        else if (ret == Z_OK || ret == Z_BUF_ERROR) {
+            in->in_member = true;
+        }
+        else {
+            return -1;
+        }
+    }
+    return (int) (out_len - in->zs.avail_out);
+}
+
+// A 64 KB parse buffer (kseq defaults to 16 KB) means fewer read and
+// inflate calls per megabyte.
+KSTREAM_INIT(Input *, input_read, 65536)
+__KSEQ_TYPE(Input *)
+__KSEQ_BASIC(static, Input *)
+__KSEQ_READ(static)
 
 struct FastReader::Impl
 {
-    gzFile fp = nullptr;
+    Input input;
     kseq_t *seq = nullptr;
 
     ~Impl()
     {
         if (seq != nullptr) kseq_destroy(seq);
-        if (fp != nullptr) gzclose(fp);
     }
 };
 
@@ -27,16 +131,17 @@ struct FastReader::Impl
 FastReader::FastReader(std::string filename)
     : m_filename(filename), m_impl(new Impl)
 {
-    // zlib owns the file descriptor and closes it in gzclose.
-    errno = 0;
-    m_impl->fp = (filename == "-") ? gzdopen(fileno(stdin), "r")
-                                   : gzopen(filename.c_str(), "r");
-    if (m_impl->fp == nullptr) {
-        throw std::runtime_error(
-            "Cannot open " + filename + ": " +
-            (errno != 0 ? std::strerror(errno) : "out of memory"));
+    if (filename == "-") {
+        m_impl->input.fd = fileno(stdin);
     }
-    m_impl->seq = kseq_init(m_impl->fp);
+    else {
+        m_impl->input.fd = ::open(filename.c_str(), O_RDONLY);
+        if (m_impl->input.fd < 0) {
+            throw std::runtime_error("Cannot open " + filename + ": " + std::strerror(errno));
+        }
+        m_impl->input.close_fd = true;
+    }
+    m_impl->seq = kseq_init(&m_impl->input);
 }
 
 
@@ -120,6 +225,25 @@ int FastReader::read(std::vector<Kraken2SequenceRequest> &seqs, int batch_size,
         }
     }
     return rtn;
+}
+
+
+int FastReader::read_pair(Kraken2SequenceRequest &rec, FastReader &mate_reader,
+                          bool &mismatched)
+{
+    Kraken2SequenceRequest mate;
+    bool got1 = read(rec) >= 0;
+    bool got2 = mate_reader.read(mate) >= 0;
+    if (got1 && got2) {
+        rec.mutable_mate()->Swap(&mate);
+        return 1;
+    }
+    // Different lengths, not a read error in one of the files.
+    if (got1 != got2 && !failed() && !mate_reader.failed()) {
+        mismatched = true;
+    }
+    rec.Clear();
+    return 0;
 }
 
 
