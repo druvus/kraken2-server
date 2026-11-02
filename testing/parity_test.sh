@@ -392,6 +392,22 @@ if [ -x "$RAW_CLIENT" ]; then
     wait $SERVER_PID
     check "server survived malformed records" 0 $?
     trap - EXIT
+
+    # A result must reach the client while it keeps the stream open. Results
+    # held back until the client sends more deadlock a client that is
+    # waiting for results before sending, as happens with very long reads.
+    echo "+++ Results flow while the stream is open +++"
+    "$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $PORT > $WORK/server_hold.log 2>&1 &
+    SERVER_PID=$!
+    trap 'kill $SERVER_PID 2> /dev/null' EXIT
+    for i in $(seq 1 60); do "$CLIENT" --port $PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break; sleep 1; done
+    head -1 $WORK/records.tsv > $WORK/one_record.tsv
+    "$RAW_CLIENT" 127.0.0.1:$PORT --hold 10 < $WORK/one_record.tsv > $WORK/hold.out 2> $WORK/hold.err
+    check "result arrives before the client closes the stream" 0 $?
+    check "held stream returned the record" good "$(cut -f2 $WORK/hold.out)"
+    "$CLIENT" --port $PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+    wait $SERVER_PID
+    trap - EXIT
 else
     echo "SKIP  malformed quality test (raw_client not built; use -DBUILD_TEST_TOOLS=ON)"
 fi
