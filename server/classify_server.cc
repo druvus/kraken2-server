@@ -41,6 +41,12 @@ Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
               << pool.thread_count() << " thread(s)." << std::endl;
 }
 
+void Kraken2ServerClassifier::WaitForLoad() {
+    if (loader.joinable()) {
+        loader.join();
+    }
+}
+
 void Kraken2ServerClassifier::StartLoading() {
     if (!loader.joinable()) {
         loader = std::thread([this]() { LoadIndex(); });

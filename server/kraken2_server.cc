@@ -353,7 +353,9 @@ int main(int argc, char **argv) {
     if (status != EX_OK) {
         return status;
     }
-    // Waits for a database load still in progress (the classifier's
-    // destructor joins the loader); a second signal exits at once.
+    // A shutdown during the load waits for it to finish (it cannot be
+    // interrupted; a second signal exits at once), and the status then
+    // says whether it succeeded.
+    classifier->WaitForLoad();
     return classifier->index_available ? EX_OK : EX_IOERR;
 }

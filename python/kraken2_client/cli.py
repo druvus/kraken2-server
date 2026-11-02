@@ -88,9 +88,14 @@ def main(argv=None):
 def _classify(client, records, report_path):
     report = io.StringIO() if report_path else None
     out = sys.stdout
+    if hasattr(out, "reconfigure"):
+        # read ids that are not UTF-8 are written back byte for byte
+        out.reconfigure(errors="surrogateescape")
     status = 0
     try:
-        for hit in client.classify(records, report=report):
+        # flushed after each message from the server, so results reach a
+        # file or pipe as they arrive
+        for hit in client.classify(records, report=report, on_message=out.flush):
             out.write(hit.to_kraken_line())
             out.write("\n")
         out.flush()
