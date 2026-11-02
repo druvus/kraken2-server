@@ -26,11 +26,16 @@ struct MinToken { uint8_t kind; uint32_t key_idx; };
 
 Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
         : opts(options), pool(opts.thread_pool < 0 ? 0 : (size_t) opts.thread_pool) {
-    // The pool handles classification tasks; the index loads in the
-    // background.
+    // The pool handles classification tasks. The index is loaded in the
+    // background once StartLoading() is called.
     std::cout << "Created classification thread pool with "
               << pool.thread_count() << " thread(s)." << std::endl;
-    loader = std::thread([this]() { LoadIndex(); });
+}
+
+void Kraken2ServerClassifier::StartLoading() {
+    if (!loader.joinable()) {
+        loader = std::thread([this]() { LoadIndex(); });
+    }
 }
 
 Kraken2ServerClassifier::~Kraken2ServerClassifier(){
