@@ -1,5 +1,10 @@
 # Multi-database classification
 
+Status: implemented in v0.2.0 (`--db` repeated, `--strict-merge`); see
+"Verification" for how it is tested. The rest of this document is the
+design as written before the implementation, kept because it records why
+the server behaves as it does.
+
 Design for classifying reads against several Kraken 2 databases in one server,
 following what `k2 classify --db a,b` does in Kraken 2.17. This document records
 the upstream behaviour as read from the submodule at commit 01fb1d9 (`scripts/k2`,
@@ -49,7 +54,8 @@ Consequences worth stating:
 - The documented `--merge-policy first-classified|last-classified|resolve-lca`
   option is parsed by `k2` but not passed to `merge` at this commit; only
   the LCA behaviour exists.
-- `merge` is a separate binary that the bioconda package does not ship.
+- `merge` is a separate binary. The bioconda `kraken2` 2.17.2 package
+  ships it under `share/kraken2-2.17.2/libexec`, where `k2` finds it.
 
 ## Server design
 
@@ -112,10 +118,12 @@ built from the input `taxo.k2d` taxonomies themselves:
 5. Result: `tax_id` is the merged external id; the hit list is the merged
    taxon vector formatted by `AddHitlistString`, which already collapses
    runs; `name` stays unsent.
-6. Report counters are kept per merged taxon. `add_kmer` is called with the
-   minimizer on a new lookup and `increaseKmerCount(1)` on a repeat, the same
-   as the single-database path, so `--report-kmer` gives real distinct
-   counts rather than the sums `merge` produces without dumps.
+6. Report counters are kept per merged taxon, the same as the
+   single-database path: with `--report-kmer`, `add_kmer` is called with the
+   minimizer on a new lookup and `increaseKmerCount(1)` on a repeat, so the
+   report gives real distinct counts rather than the sums `merge` produces
+   without dumps. (Since v0.2.2 the distinct-count sketch is only kept with
+   `--report-kmer`, which is the only report that shows it.)
 
 ### Options and compatibility
 
@@ -139,16 +147,13 @@ built from the input `taxo.k2d` taxonomies themselves:
   with overlapping and disjoint leaves; conflict detection; element-wise
   LCA merge on hand-built taxon vectors including markers; call
   recomputation with hits spread across databases.
-- Integration: split the virus-zymo library into two databases (or build
-  two tiny nucleotide databases the way `make_protein_db.sh` builds the
-  protein one) and compare the server against `k2 classify --db a,b` with
-  the `merge` binary built from the submodule. Expect identical C/U, taxid
-  and hit list columns; the report's k-mer columns may differ as described.
-- Single-database output must remain byte-identical (existing parity
-  script).
-
-## Effort
-
-Loading refactor half a day, merged taxonomy builder with tests one day,
-per-read merge with tests one day, integration test and `merge` build one
-day, documentation half a day.
+- Integration (`testing/parity_test.sh`, multi-database section): two tiny
+  nucleotide databases sharing a species, built by `testing/make_multidb.sh`,
+  are classified by the server and by `k2 classify --db a,b` from bioconda,
+  single-end and paired. The per-read output and the report are identical.
+  The section also checks that `--hit-groups` is ignored by default, as in
+  `k2`, and applied with `--strict-merge`, that a single small database
+  still matches `kraken2`, and that databases built with different settings
+  are refused at load time.
+- Single-database output remains byte-identical to `kraken2` (the rest of
+  the parity script).
