@@ -8,10 +8,19 @@
 // An empty quals field sends the record as FASTA. All records are sent as
 // one batch. Results are printed as: C/U  id  taxid  size[|size2]  hitlist
 //
-// Usage: raw_client <host:port> < records.tsv
+// Usage: raw_client <host:port> [--hold SECONDS] < records.tsv
+//
+// With --hold, the stream is kept open after the batch is sent, and the
+// client fails (exit 3) unless the first result arrives within SECONDS.
+// A server that holds results back until the client sends more would make
+// a real client wait forever.
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -40,8 +49,11 @@ static void Fill(Kraken2SequenceRequest &rec, const std::string &id,
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        std::cerr << "Usage: raw_client <host:port> < records.tsv" << std::endl;
+    int hold_seconds = -1;
+    if (argc == 4 && std::string(argv[2]) == "--hold") {
+        hold_seconds = std::atoi(argv[3]);
+    } else if (argc != 2) {
+        std::cerr << "Usage: raw_client <host:port> [--hold SECONDS] < records.tsv" << std::endl;
         return 2;
     }
 
@@ -66,18 +78,37 @@ int main(int argc, char **argv) {
     grpc::ClientContext context;
     auto stream = stub->ClassifyStream(&context);
     stream->Write(batch);
-    stream->WritesDone();
 
-    Kraken2SequenceStreamResult result;
-    while (stream->Read(&result)) {
-        if (!result.has_classifications()) continue;
-        for (const auto &r : result.classifications().classes()) {
-            std::cout << (r.classified() ? "C" : "U") << '\t' << r.id() << '\t'
-                      << r.tax_id() << '\t' << r.size();
-            if (r.paired()) std::cout << '|' << r.size2();
-            std::cout << '\t' << r.hitlist() << '\n';
+    std::atomic<bool> got_result{false};
+    std::thread reader([&]() {
+        Kraken2SequenceStreamResult result;
+        while (stream->Read(&result)) {
+            if (!result.has_classifications()) continue;
+            got_result = true;
+            for (const auto &r : result.classifications().classes()) {
+                std::cout << (r.classified() ? "C" : "U") << '\t' << r.id() << '\t'
+                          << r.tax_id() << '\t' << r.size();
+                if (r.paired()) std::cout << '|' << r.size2();
+                std::cout << '\t' << r.hitlist() << '\n';
+            }
+        }
+    });
+
+    if (hold_seconds >= 0) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(hold_seconds);
+        while (!got_result && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (!got_result) {
+            std::cerr << "No result within " << hold_seconds
+                      << " s while the stream was open." << std::endl;
+            context.TryCancel();
+            reader.join();
+            return 3;
         }
     }
+    stream->WritesDone();
+    reader.join();
     grpc::Status status = stream->Finish();
     if (!status.ok()) {
         std::cerr << "RPC failed: " << status.error_message() << std::endl;

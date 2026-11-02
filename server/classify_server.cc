@@ -178,46 +178,74 @@ void Kraken2ServerClassifier::LoadIndex() {
     index_available = true;
 }
 
-// Drain classified batches onto the gRPC stream until the queue is closed
-// and empty. Batches finish in any order on the pool; they are held here
-// and written in input order, as kraken2 does, so the client sees results
-// in the same order as its reads. Runs on its own thread so writes overlap
-// with classification. Returns the number of batches that could not be
-// written because an earlier batch never arrived.
-static size_t ResultsHandler(
+// Per-stream accounting between the gRPC reader, the pool tasks and the
+// result writer. A request batch holds a slot from the moment it is read
+// until its results are written (or discarded), so the number of batches a
+// stream keeps in memory is bounded even when the client stops reading.
+struct StreamSlots {
+    std::mutex mtx;
+    std::condition_variable cv;
+    size_t unwritten = 0;   // batches read and not yet written or discarded
+    size_t running = 0;     // batches queued in or running on the pool
+    bool writer_dead = false;
+
+    void release_written() {
+        std::lock_guard<std::mutex> lock(mtx);
+        unwritten--;
+        cv.notify_all();
+    }
+    void task_done() {
+        std::lock_guard<std::mutex> lock(mtx);
+        running--;
+        cv.notify_all();
+    }
+};
+
+// Write classified batches to the gRPC stream until the queue is closed and
+// empty. Batches finish in any order on the pool; they are held here and
+// written in input order, as kraken2 does, so the client sees results in the
+// same order as its reads. Runs on its own thread so writes overlap with
+// classification. Each batch is written as soon as it is next in order,
+// without a buffering hint: a client waiting for results before it sends
+// more would otherwise wait for results the server is holding back.
+// Once a batch has failed, or a write has failed because the client went
+// away, later batches are discarded rather than written.
+static void ResultsHandler(
         ServerStream *stream,
         taxon_counters_t &stream_taxon_counters,
         ClassificationStats &stream_stats,
-        ThreadSafeQueue<BatchResults> &results_queue) {
+        ThreadSafeQueue<BatchResults> &results_queue,
+        StreamSlots &slots) {
     std::map<uint64_t, BatchResults> pending;
     uint64_t next_sequence = 0;
+    bool stopped = false;
     while (std::optional<BatchResults> res = results_queue.pop_wait()) {
         pending.emplace(res->sequence, std::move(*res));
         for (auto it = pending.find(next_sequence); it != pending.end();
              it = pending.find(++next_sequence)) {
             BatchResults &batch = it->second;
-            // The client is configured to receive messages up to INT_MAX, and
-            // the client limits request batches to 128 MB, so a batch of
-            // results always fits.
-            Kraken2SequenceStreamResult result;
-            result.mutable_classifications()->Swap(&batch.k2results);
-            stream->Write(result, WriteOptions().set_buffer_hint());
-            // update stats for the stream
-            stream_stats.total_bases += batch.stats.total_bases;
-            stream_stats.total_classified += batch.stats.total_classified;
-            stream_stats.total_sequences += batch.stats.total_sequences;
-            // update taxon_counters for the stream
-            for (auto &kv_pair : batch.taxon_counters) {
-                stream_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
+            if (batch.failed) {
+                stopped = true;
+            }
+            if (!stopped) {
+                Kraken2SequenceStreamResult result;
+                result.mutable_classifications()->Swap(&batch.k2results);
+                if (stream->Write(result)) {
+                    // Only results that reached the client are counted.
+                    stream_stats.total_bases += batch.stats.total_bases;
+                    stream_stats.total_classified += batch.stats.total_classified;
+                    stream_stats.total_sequences += batch.stats.total_sequences;
+                    for (auto &kv_pair : batch.taxon_counters) {
+                        stream_taxon_counters[kv_pair.first] += std::move(kv_pair.second);
+                    }
+                } else {
+                    stopped = true;
+                }
             }
             pending.erase(it);
+            slots.release_written();
         }
     }
-    if (!pending.empty()) {
-        std::cerr << "Warning: " << pending.size()
-                  << " result batch(es) never reached the writer." << std::endl;
-    }
-    return pending.size();
 }
 
 grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
@@ -232,30 +260,47 @@ grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
     struct timeval tv1, tv2;
     gettimeofday(&tv1, nullptr);
 
-    // Queue and thread that aggregate batch results and write them to the
-    // output stream.
-    ThreadSafeQueue<BatchResults> results_queue;
-    std::promise<size_t> unwritten_promise;
-    std::future<size_t> unwritten = unwritten_promise.get_future();
-    std::thread results_thread([&]() {
-        unwritten_promise.set_value(ResultsHandler(
-            stream, stream_taxon_counters, stream_stats, results_queue));
-    });
-
     // Set when a batch throws. The stream is then failed rather than
-    // completed with results missing, since the writer holds every later
-    // batch back to keep the output in order.
+    // completed with results missing.
     std::atomic<bool> failed{false};
     std::string failure;
     std::mutex failure_mtx;
+    auto record_failure = [&](const std::string &what) {
+        std::lock_guard<std::mutex> lock(failure_mtx);
+        if (!failed.exchange(true))
+            failure = what;
+    };
 
-    // Backpressure: limit the number of request batches held by this stream
-    // (queued in the pool or being classified) so a fast client cannot
-    // make the server buffer its whole input.
-    const size_t max_in_flight = std::max<size_t>(4, 2 * pool.thread_count());
-    std::mutex in_flight_mtx;
-    std::condition_variable in_flight_cv;
-    size_t in_flight = 0;
+    // Queue and thread that write results to the output stream, in order.
+    StreamSlots slots;
+    ThreadSafeQueue<BatchResults> results_queue;
+    std::thread results_thread([&]() {
+        try {
+            ResultsHandler(stream, stream_taxon_counters, stream_stats, results_queue, slots);
+        }
+        catch (const std::exception &ex) {
+            record_failure(std::string("result writer: ") + ex.what());
+        }
+        catch (...) {
+            record_failure("result writer: unknown error");
+        }
+        std::lock_guard<std::mutex> lock(slots.mtx);
+        if (!failed && slots.unwritten > 0) {
+            // cannot happen: every batch is released before the queue closes
+            record_failure("result writer stopped early");
+        }
+        slots.writer_dead = true;
+        slots.cv.notify_all();
+    });
+
+    // Backpressure: limit the request batches this stream has on the pool,
+    // so a fast client cannot make the server buffer its whole input, and
+    // the batches it holds in total (on the pool or classified and waiting
+    // to be written), so a client that stops reading cannot either. The
+    // second limit is looser so that finished batches waiting behind a slow
+    // one in the output order do not stop the pool from being fed.
+    const size_t max_running = std::max<size_t>(4, 2 * pool.thread_count());
+    const size_t max_unwritten = 2 * max_running;
 
     // Classify while reads are still being received on the input stream
     uint64_t sequence = 0;
@@ -267,37 +312,50 @@ grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
             break;
         }
         {
-            std::unique_lock<std::mutex> lock(in_flight_mtx);
-            in_flight_cv.wait(lock, [&] { return in_flight < max_in_flight; });
-            in_flight++;
+            std::unique_lock<std::mutex> lock(slots.mtx);
+            slots.cv.wait(lock, [&] {
+                return (slots.running < max_running && slots.unwritten < max_unwritten) ||
+                       slots.writer_dead;
+            });
+            if (slots.writer_dead) break;
+            slots.unwritten++;
+            slots.running++;
         }
         const uint64_t this_sequence = sequence++;
-        pool.push([this, req, this_sequence, &results_queue, &in_flight_mtx, &in_flight_cv, &in_flight,
-                   &failed, &failure, &failure_mtx]() {
+        pool.push([this, req, this_sequence, &results_queue, &slots, &record_failure]() {
             try {
                 ProcessBatch(*req, this_sequence, results_queue);
             }
             catch (const std::exception &ex) {
                 std::cerr << "Error classifying batch " << this_sequence << ": " << ex.what() << std::endl;
-                std::lock_guard<std::mutex> lock(failure_mtx);
-                if (!failed.exchange(true))
-                    failure = ex.what();
+                record_failure(ex.what());
+                // A marker in the batch's place keeps the writer's ordering
+                // moving; it discards this batch and every later one.
+                BatchResults marker;
+                marker.sequence = this_sequence;
+                marker.failed = true;
+                results_queue.push(std::move(marker));
             }
-            std::lock_guard<std::mutex> lock(in_flight_mtx);
-            in_flight--;
-            in_flight_cv.notify_one();
+            catch (...) {
+                std::cerr << "Error classifying batch " << this_sequence << ": unknown error" << std::endl;
+                record_failure("unknown error");
+                BatchResults marker;
+                marker.sequence = this_sequence;
+                marker.failed = true;
+                results_queue.push(std::move(marker));
+            }
+            slots.task_done();
         });
     }
 
-    // Wait for the outstanding batches, then let the results thread drain
-    // the queue and finish.
+    // Wait until no pool task can touch this stream's state any more, then
+    // let the writer drain the queue and finish.
     {
-        std::unique_lock<std::mutex> lock(in_flight_mtx);
-        in_flight_cv.wait(lock, [&] { return in_flight == 0; });
+        std::unique_lock<std::mutex> lock(slots.mtx);
+        slots.cv.wait(lock, [&] { return slots.running == 0; });
     }
     results_queue.close();
     results_thread.join();
-    const size_t unwritten_batches = unwritten.get();
 
     gettimeofday(&tv2, nullptr);
     // generate the report, and update servers total history. Only the
@@ -307,10 +365,9 @@ grpc::Status Kraken2ServerClassifier::ProcessSequenceStream(
         stream_taxon_counters, total_taxon_counters, stats_mtx);
 
     std::cerr << "Finished stream handler." << std::endl;
-    if (failed || unwritten_batches > 0) {
-        std::string what = failed ? failure : "a result batch was lost";
+    if (failed) {
         return grpc::Status(grpc::StatusCode::INTERNAL,
-            "Classification of a request batch failed: " + what +
+            "Classification of a request batch failed: " + failure +
             "; the results are incomplete.");
     }
     return grpc::Status::OK;

@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- A stream hung forever with very long reads (about 30 Mb and more, such as
+  assembled contigs): the server held results back with a buffering hint
+  while the client waited for them before sending more. Results are now
+  written as soon as they are next in order.
+- A client that stops reading results could make the server hold
+  classified batches without limit. A request batch now counts against
+  the stream's limit until its results are written.
+- A batch that failed on the server stopped the output ordering; it is
+  now replaced by a marker so the stream ends with `INTERNAL` promptly.
+  Exceptions of any type in classification or result writing fail the
+  stream instead of terminating the server, and statistics count only
+  results that reached the client.
 - SIGTERM and Ctrl-C did not stop the server while a client held a stream
   open, for example one fed by a running sequencer. Open streams now get
   10 seconds and are then cancelled, and a second signal exits at once.
