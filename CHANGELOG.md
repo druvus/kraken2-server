@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connecting to the server, closes its input files, counts a message as
   in flight before sending it, and no longer reports a read error in one
   of two paired files as mismatched lengths.
+- `k2client` ended in a traceback with exit 1 for a FASTQ file cut off
+  part way through a record or a truncated gzip file, a missing input
+  file, an unwritable report, and standard output that could not be
+  written. It now exits 74, 66, 73 and 74 like `kraken2_client`. `read_fastx` raises `InputError` for the
+  truncated files and opens its file at once, so a missing file is
+  reported by the call; reading from `-` no longer closes standard input.
+- The report passed to `classify()` is written for the records that were
+  classified also when the record source fails part way.
 
 ### Changed
 - The distinct k-mer estimate (a HyperLogLog sketch per taxon) is computed
@@ -50,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of about 4.5 GB, and its peak drops from 6.4 to 5.3 GB.
 - The parity test compares `--report-kmer` reports with
   `kraken2 --report-minimizer-data`.
+- The Python client's in-flight tracker took about 11 µs per result with
+  a full window of 64,000 records, because it removed from the front of a
+  list; it now uses a deque (0.3 µs).
 
 ## [v0.2.1] - 2026-10-28
 ### Fixed

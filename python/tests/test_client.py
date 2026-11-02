@@ -18,7 +18,7 @@ import time
 
 import pytest
 
-from kraken2_client import (TLS, Classification, Client, ShutdownRefused, read_fastx, read_pairs)
+from kraken2_client import (TLS, Classification, Client, InputError, ShutdownRefused, read_fastx, read_pairs)
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SERVER = os.environ.get("KRAKEN2_SERVER", os.path.join(ROOT, "build", "server", "kraken2_server"))
@@ -117,6 +117,44 @@ def test_read_pairs_rejects_mismatched_lengths(tmp_path):
         next(it)
 
 
+def test_read_fastx_reports_truncated_fastq(tmp_path):
+    fq = tmp_path / "t.fq"
+    fq.write_text("@r1\nACGT\n+\nIIII\n@r2\nACG")
+    it = read_fastx(str(fq))
+    assert next(it) == ("r1", "ACGT", "IIII")
+    with pytest.raises(InputError, match="r2"):
+        next(it)
+
+
+def test_read_fastx_reports_short_quality(tmp_path):
+    fq = tmp_path / "t.fq"
+    fq.write_text("@r1\nACGT\n+\nII\n")
+    with pytest.raises(InputError):
+        list(read_fastx(str(fq)))
+
+
+def test_read_fastx_reports_truncated_gzip(tmp_path):
+    full = gzip.compress(b"@r1\nACGT\n+\nIIII\n" * 2000)
+    gz = tmp_path / "t.fq.gz"
+    gz.write_bytes(full[: len(full) // 2])
+    with pytest.raises(InputError):
+        list(read_fastx(str(gz)))
+
+
+def test_read_fastx_opens_the_file_at_once(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        read_fastx(str(tmp_path / "missing.fq"))
+    with pytest.raises(FileNotFoundError):
+        read_pairs(str(tmp_path / "missing_1.fq"), str(tmp_path / "missing_2.fq"))
+
+
+def test_read_fastx_leaves_stdin_open(monkeypatch):
+    fake = io.StringIO("@r1\nACGT\n+\nIIII\n")
+    monkeypatch.setattr(sys, "stdin", fake)
+    assert list(read_fastx("-")) == [("r1", "ACGT", "IIII")]
+    assert not fake.closed
+
+
 def test_classification_line_format():
     c = Classification(True, "r", 562, 100, "562:5 0:2")
     assert c.to_kraken_line() == "C\tr\t562\t100\t562:5 0:2"
@@ -192,6 +230,33 @@ def test_cli_mismatched_pairs(server, testdata):
     assert ref.returncode == 65
     assert out == ref.stdout
     assert out.count("\n") == 1000
+
+
+def test_cli_exit_codes(server, tmp_path):
+    rc, _, err = py_cli(server.port, "--sequence", str(tmp_path / "missing.fq"))
+    assert rc == 66, err
+    rc, _, err = py_cli(server.port, "--sequence", READS, "--report", str(tmp_path / "no_dir" / "r.txt"))
+    assert rc == 73, err
+    with open("/dev/full", "w") as full:
+        r = subprocess.run([sys.executable, "-m", "kraken2_client.cli", "--host-ip", "127.0.0.1",
+                            "--port", str(server.port), "--sequence", READS],
+                           stdout=full, stderr=subprocess.PIPE, text=True)
+    assert r.returncode == 74, r.stderr
+
+
+def test_cli_truncated_fastq(server, tmp_path):
+    with gzip.open(READS, "rb") as f:
+        head = f.read(5_000_000)
+    cut = tmp_path / "cut.fq"
+    cut.write_bytes(head)
+    complete = head.count(b"\n+\n")
+    report = tmp_path / "cut.report"
+    rc, out, err = py_cli(server.port, "--sequence", str(cut), "--report", str(report))
+    assert rc == 74, err
+    assert "truncated" in err
+    assert out.count("\n") == complete
+    # the report covers the records that were classified, as with the C++ client
+    assert report.read_text().startswith("% of Seqs")
 
 
 def test_results_arrive_in_input_order(server):
