@@ -24,6 +24,15 @@ enum MinTokKind { TOK_LOOKUP, TOK_SKIP, TOK_REPEAT, TOK_AMBIG,
                   TOK_BORDER_MATE, TOK_BORDER_FRAME };
 struct MinToken { uint8_t kind; uint32_t key_idx; };
 
+// Free a scratch vector whose capacity has grown past 64 MB; smaller ones
+// keep their capacity so ordinary reads do not reallocate.
+template <typename T>
+static void ReleaseIfLarge(std::vector<T> &v) {
+    const size_t keep_bytes = 64 * 1024 * 1024;
+    if (v.capacity() * sizeof(T) > keep_bytes)
+        std::vector<T>().swap(v);
+}
+
 Kraken2ServerClassifier::Kraken2ServerClassifier(Options &options)
         : opts(options), pool(opts.thread_pool < 0 ? 0 : (size_t) opts.thread_pool) {
     // The pool handles classification tasks; the index loads in the
@@ -576,7 +585,12 @@ Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
                 {
                     // Increment only for a DB hit on a new minimizer.
                     minimizer_hit_groups++;
-                    curr_taxon_counts[taxon].add_kmer(lookup_keys[tok.key_idx]);
+                    // The distinct k-mer estimate (a HyperLogLog sketch per
+                    // taxon) is only reported with --report-kmer.
+                    if (opts.report_kmer_data)
+                        curr_taxon_counts[taxon].add_kmer(lookup_keys[tok.key_idx]);
+                    else
+                        curr_taxon_counts[taxon].increaseKmerCount(1);
                 }
                 break;
             default: // TOK_REPEAT
@@ -645,6 +659,15 @@ Kraken2SequenceResult Kraken2ServerClassifier::ClassifySequence(
         AddHitlistString(hitlist, taxa, taxonomy);
         result.set_hitlist(hitlist.str());
     }
+
+    // The scratch buffers keep their capacity between reads. After a very
+    // long read (a contig or chromosome), give the memory back instead of
+    // holding it for the life of the pool thread.
+    ReleaseIfLarge(lookup_keys);
+    ReleaseIfLarge(tok_stream);
+    ReleaseIfLarge(lookup_vals);
+    for (auto &vals : db_taxa)
+        ReleaseIfLarge(vals);
 
     return result;
 }
