@@ -125,14 +125,22 @@ the database is loaded.
 | `-k, --shutdown` | ask the server to stop (needs `--allow-remote-shutdown` on the server) |
 | `-t, --tls`, `--tls-ca`, `--tls-cert`, `--tls-key`, `--tls-server-name` | TLS, see "Security" |
 
-Exit status is 0 on success, 64 for a usage error, 65 for mismatched
-paired-end inputs, 69 when the server cannot be reached, 74 when an input
-file cannot be read or parsed, 76 when the server completed the stream
-with fewer results than reads sent, or the gRPC status code of a failed
-request: 13 when the server could not classify a batch, 14 when the
-server went away during the stream. In every failure the lines already
-printed are complete results in input order. A client started while the
-server is still loading its database waits.
+Exit status is 0 on success, or:
+
+| status | meaning |
+|---|---|
+| 64 | usage error |
+| 65 | paired-end inputs of different lengths, or a read over the 128 MiB message limit (the client stops at that read) |
+| 66 | an input file cannot be opened |
+| 69 | the server cannot be reached |
+| 73 | the report file cannot be written |
+| 74 | an input file cannot be read or parsed (including a FASTQ file cut off part way through a record), or standard output cannot be written |
+| 76 | the server completed the stream with fewer results than reads sent |
+| 13, 14 | gRPC status of a failed stream: the server could not classify a batch (13), or went away (14) |
+
+In every failure the lines already printed are complete results in input
+order. A client started while the server is still loading its database
+waits.
 
 ### Memory and threads
 

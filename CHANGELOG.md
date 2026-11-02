@@ -27,6 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exit immediately with 69 and 78.
 - Signals are taken on a dedicated thread with `sigwait` instead of a
   signal handler that was not async-signal-safe.
+- `kraken2_client` exited 0 when the report could not be written, when
+  standard output could not be written (a full disk), when a plain FASTQ
+  file ended part way through a record (the partial record was classified
+  as a shorter read), and when it skipped a read over the 128 MiB message
+  limit. These now exit 73, 74, 74 and 65; the client stops at an
+  oversized read so the output keeps one line per input read.
+- `kraken2_client` waited on its input after the server went away, so a
+  client reading a quiet pipe never exited. It now exits with the stream's
+  status two seconds after the stream ends.
+- `kraken2_client` reports a missing input file (exit 66) before
+  connecting to the server, closes its input files, counts a message as
+  in flight before sending it, and no longer reports a read error in one
+  of two paired files as mismatched lengths.
 
 ## [v0.2.1] - 2026-10-28
 ### Fixed

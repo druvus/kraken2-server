@@ -16,7 +16,9 @@ class FastReader
 {
 public:
     // Open a FASTA/FASTQ file, plain or gzip compressed. "-" reads stdin.
-    // Throws std::runtime_error if the file cannot be opened.
+    // Throws std::runtime_error if the file cannot be opened. A FASTQ file
+    // that ends part way through a record is reported as a truncated
+    // quality string (status -2).
     FastReader(std::string filename);
     ~FastReader();
     FastReader(const FastReader &) = delete;
@@ -48,4 +50,5 @@ private:
     std::string m_filename;
     std::unique_ptr<Impl> m_impl;
     int m_last_status = 0;
+    bool m_fastq = false;  // set once a record with qualities has been read
 };

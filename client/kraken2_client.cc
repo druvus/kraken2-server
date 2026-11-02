@@ -1,6 +1,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <fstream>
@@ -79,9 +82,10 @@ typedef std::shared_ptr<ClientReaderWriter<Kraken2SequenceRequestMulti, Kraken2S
 #define MAX_BATCHES 16                                // file batches buffered ahead of the writer
 
 // Reads and bytes sent and not yet answered. The writer adds a message
-// after sending it and waits while the limits are exceeded; the reader
-// retires reads as results arrive, in order, and releases a message's
-// bytes once all of its reads are answered.
+// just before sending it (so its first result cannot arrive before it is
+// counted) and waits while the limits are exceeded; the reader retires
+// reads as results arrive, in order, and releases a message's bytes once
+// all of its reads are answered.
 class InFlight {
 public:
     void add(uint64_t reads, uint64_t bytes) {
@@ -89,6 +93,15 @@ public:
         messages_.push_back({reads, bytes});
         reads_ += reads;
         bytes_ += bytes;
+    }
+    // Take back the message added last, when sending it failed.
+    void undo_last() {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (messages_.empty()) return;
+        reads_ -= messages_.back().reads;
+        bytes_ -= messages_.back().bytes;
+        messages_.pop_back();
+        changed_.notify_all();
     }
     void retire_one() {
         std::lock_guard<std::mutex> lock(mtx_);
@@ -141,15 +154,33 @@ public:
      *
      * @param sequence_name  path to reads (R1 for paired data)
      * @param sequence2_name path to mates (R2), empty for single-end data
-     * @return EX_IOERR if sequences could not be read
-     * @return EX_DATAERR if the two paired-end inputs have different lengths
-     * @return EX_UNAVAILABLE if sequences could not be sent to server
+     * @return EX_NOINPUT if an input file cannot be opened
+     * @return EX_IOERR if sequences could not be read, or the output could
+     *         not be written
+     * @return EX_CANTCREAT if the report could not be written
+     * @return EX_DATAERR if the two paired-end inputs have different
+     *         lengths, or a read exceeds the message limit
+     * @return EX_UNAVAILABLE if the server cannot be reached
      * @return EX_PROTOCOL if the server returned fewer results than reads sent
-     * @return else gRPC status code
+     * @return else the gRPC status code of a failed stream
      */
     int ClassifySequences(const std::string &sequence_name,
                           const std::string &sequence2_name,
                           const std::string &report_file) {
+        // Open the inputs first, so a missing file is reported as such
+        // rather than after waiting for the server.
+        std::unique_ptr<FastReader> reader, mate_reader;
+        try {
+            reader.reset(new FastReader(sequence_name));
+            if (!sequence2_name.empty()) {
+                mate_reader.reset(new FastReader(sequence2_name));
+            }
+        }
+        catch (const std::exception &ex) {
+            std::cerr << ex.what() << std::endl;
+            return EX_NOINPUT;
+        }
+
         std::cerr << "Classifying sequence stream." << std::endl;
         int state = WaitForServer();
         if (state != 0) {return state;}
@@ -166,7 +197,7 @@ public:
         // reads data from file into queue
         std::future<int> fastq_batches = std::async(
             std::launch::async, &SequenceClient::FastBatcher, this,
-            std::ref(sequence_name), std::ref(sequence2_name), std::ref(batches_queue));
+            reader.get(), mate_reader.get(), std::ref(batches_queue));
 
         // take data from queue and send over gRPC
         std::future<int> stream_batches = std::async(
@@ -176,39 +207,64 @@ public:
         // reading back results on gRPC stream
         std::future<int> recv_reads = std::async(
             std::launch::async, &SequenceClient::StreamReader, this,
-            std::ref(in_flight), std::ref(report_file), std::ref(stream));
+            std::ref(in_flight), std::ref(report_file), std::ref(stream),
+            std::ref(batches_queue));
 
-        // wait for things to finish in order
-        fastq_batches.wait();
-        stream_batches.wait();
+        // The stream is over once the reader has seen its end; that also
+        // releases the writer. The file reader is waited for last, and only
+        // briefly, as it may be blocked on a pipe that has no more data.
         recv_reads.wait();
-        std::cerr << "Done waiting" << std::endl;
-
+        stream_batches.wait();
         const int sent = stream_batches.get();
         const int received = recv_reads.get();
         std::cerr << "Sent    : " << sent << std:: endl;
         std::cerr << "Received: " << received << std::endl;
 
-        // Handle the stream response
+        int code = EX_OK;
         Status status = stream->Finish();
         if (!status.ok()) {
             std::cerr << "Client RPC stream failed: " << status.error_message() << std::endl;
-            return status.error_code();
+            code = status.error_code();
         }
-        if (received != sent) {
+        else if (read_too_large) {
+            code = EX_DATAERR;
+        }
+        else if (received != sent) {
             // The server completed the stream but dropped results, which
             // it reports on its own log.
             std::cerr << "Error: the server returned " << received << " results for "
                       << sent << " reads; the output is incomplete." << std::endl;
-            return EX_PROTOCOL;
+            code = EX_PROTOCOL;
         }
-        if (fastq_batches.get() < 0) {
-            return EX_IOERR;
+
+        if (fastq_batches.wait_for(2s) != std::future_status::ready) {
+            // The input is still open, for example a pipe with no data, but
+            // the stream is over. Exit without waiting for it; the threads
+            // cannot be joined while the read blocks.
+            std::cerr << "The stream ended while the input was still open; not reading further."
+                      << std::endl;
+            std::cout.flush();
+            std::cerr.flush();
+            std::_Exit(code != EX_OK ? code : EX_SOFTWARE);
         }
-        if (pairs_mismatched) {
-            return EX_DATAERR;
+        if (fastq_batches.get() < 0 && code == EX_OK) {
+            code = EX_IOERR;
         }
-        return status.error_code();
+        if (pairs_mismatched && code == EX_OK) {
+            code = EX_DATAERR;
+        }
+        if (report_failed && code == EX_OK) {
+            code = EX_CANTCREAT;
+        }
+        std::cout.flush();
+        if (!std::cout) {
+            std::cerr << "Error: could not write the classifications to standard output."
+                      << std::endl;
+            if (code == EX_OK) {
+                code = EX_IOERR;
+            }
+        }
+        return code;
     }
 
     /**
@@ -261,13 +317,14 @@ public:
         if (!in_flight.wait_for_room(reads, msg_size, stream_closed)) {
             return 0;
         }
+        in_flight.add(reads, msg_size);
         bool ok = buffer_hint ? writer->Write(req, WriteOptions().set_buffer_hint())
                               : writer->Write(req);
         if (!ok) {
+            in_flight.undo_last();
             StreamFailed();
             return 0;
         }
-        in_flight.add(reads, msg_size);
         return reads;
     }
 
@@ -303,9 +360,15 @@ public:
                             single.mutable_seqs()->Add(std::move(read));
                             uint64_t single_size = single.ByteSizeLong();
                             if (single_size > MAX_SIZE) {
+                                // The server cannot receive it. Stop here
+                                // rather than drop it, so the output keeps
+                                // one line per input read up to this one.
                                 std::cerr << single.seqs(0).id() << ": read is larger than the "
-                                          << MAX_SIZE / (1024 * 1024) << " MB message limit; skipping." << std::endl;
-                                continue;
+                                          << MAX_SIZE / (1024 * 1024) << " MiB message limit and "
+                                          << "cannot be classified; stopping." << std::endl;
+                                read_too_large = true;
+                                stream_closed = true;
+                                break;
                             }
                             seqs_sent += SendMessage(single, single_size, in_flight, writer, true);
                             if (stream_closed) {
@@ -338,7 +401,8 @@ public:
 
     int StreamReader(
             InFlight &in_flight, const std::string &report_file,
-            ClientStream &reader) {
+            ClientStream &reader,
+            ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches) {
         Kraken2SequenceStreamResult result;
         int n_reads = 0;
         try {
@@ -363,36 +427,37 @@ public:
                       << ": " << ex.what() << std::endl;
         }
         // No more results will arrive, whether the stream ended normally
-        // or the server went away.
+        // or the server went away. Release the writer and the file reader
+        // if they are still waiting on each other.
         stream_closed = true;
         in_flight.wake();
+        batches.close();
         return n_reads;
     }
     
     /**
-     * @brief Read batches of reads (or read pairs when sequence2_file is
-     *        non-empty) from disk onto the batches queue.
+     * @brief Read batches of reads (or read pairs when mate_reader is not
+     *        null) onto the batches queue.
      *
      * @return number of batches read, or -1 if the input could not be read.
      */
     int FastBatcher(
-            const std::string &sequence_file,
-            const std::string &sequence2_file,
+            FastReader *reader_ptr,
+            FastReader *mate_reader,
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &batches_queue) {
         int n_batches = 0;
-        const bool paired = !sequence2_file.empty();
+        const bool paired = mate_reader != nullptr;
+        FastReader &reader = *reader_ptr;
+        const std::string &sequence_file = reader.filename();
         // Whatever happens, the writer must be released.
         struct Closer {
             ThreadSafeQueue<std::vector<Kraken2SequenceRequest>> &q;
             ~Closer() { q.close(); }
         } closer{batches_queue};
         try {
-            FastReader reader(sequence_file);
-            std::unique_ptr<FastReader> mate_reader;
             if (paired) {
-                mate_reader.reset(new FastReader(sequence2_file));
                 std::cerr << "Reading read pairs from files: " << sequence_file
-                          << " and " << sequence2_file << std::endl;
+                          << " and " << mate_reader->filename() << std::endl;
             }
             else {
                 std::cerr << "Reading sequences from file: " << sequence_file << std::endl;
@@ -425,7 +490,7 @@ public:
             if (mismatched) {
                 std::cerr << "Warning: paired-end inputs have different numbers of reads; "
                           << "only complete pairs were classified: "
-                          << sequence_file << ", " << sequence2_file << std::endl;
+                          << sequence_file << ", " << mate_reader->filename() << std::endl;
                 pairs_mismatched = true;
             }
             if (reader.failed() || (paired && mate_reader->failed())) {
@@ -449,6 +514,12 @@ private:
 
     // Set by FastBatcher when R1 and R2 have different read counts.
     std::atomic<bool> pairs_mismatched{false};
+
+    // Set by StreamWriter when a read exceeds the message limit.
+    std::atomic<bool> read_too_large{false};
+
+    // Set by PrintSummary when the report file cannot be written.
+    std::atomic<bool> report_failed{false};
 
     // Set when the stream can no longer carry results: a write failed or
     // the reader saw the end of the stream. The writer stops sending and
@@ -501,16 +572,18 @@ private:
     }
 
     void PrintSummary(const std::string &summary, const std::string &report_file) {
-        if (report_file != "") {
-            try {
-                std::ofstream summary_file(report_file, std::ofstream::out);
-                summary_file << summary;
-                summary_file.close();
-            }
-            catch (const std::exception &ex) {
-                std::cerr << "Failed to write report file"
-                          << ": " << ex.what() << std::endl;
-            }
+        if (report_file.empty()) {
+            return;
+        }
+        std::ofstream summary_file(report_file, std::ofstream::out);
+        if (summary_file) {
+            summary_file << summary;
+            summary_file.close();
+        }
+        if (!summary_file) {
+            std::cerr << "Error: could not write the report to " << report_file
+                      << ": " << std::strerror(errno) << std::endl;
+            report_failed = true;
         }
     }
 
