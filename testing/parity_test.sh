@@ -244,6 +244,50 @@ kill -TERM $SLOW_PID; sleep 1; kill -TERM $SLOW_PID
 wait $SLOW_PID
 check "second SIGTERM during a load exits at once" 1 "$([ $((SECONDS - T0)) -lt 10 ] && echo 1)"
 
+# The client must not exit 0 when it loses input or output, and must not
+# wait on its input once the server has gone.
+echo "+++ Client error handling +++"
+ERR_PORT=$((PORT + 6))
+"$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $ERR_PORT > $WORK/server_err.log 2>&1 &
+SERVER_PID=$!
+trap 'kill $SERVER_PID 2> /dev/null' EXIT
+for i in $(seq 1 60); do "$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break; sleep 1; done
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $WORK/does_not_exist.fq > /dev/null 2>&1
+check "missing input file exits with EX_NOINPUT" 66 $?
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $READS --report $WORK/no_such_dir/report.txt > /dev/null 2>&1
+check "unwritable report path exits with EX_CANTCREAT" 73 $?
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $READS > /dev/full 2> /dev/null
+check "output to a full device exits with EX_IOERR" 74 $?
+gzip -dc $READS | head -c 5000000 > $WORK/truncated.fq
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $WORK/truncated.fq > $WORK/truncated.out 2> /dev/null
+check "plain FASTQ cut mid-record exits with EX_IOERR" 74 $?
+check "complete records before the cut are classified" "$(gzip -dc $READS | head -c 5000000 | grep -c '^+$')" "$(wc -l < $WORK/truncated.out | tr -d ' ')"
+python3 -c "
+import sys
+with open(sys.argv[1], 'w') as f:
+    f.write('>before\n' + 'ACGT' * 100 + '\n')
+    f.write('>huge\n' + 'A' * 140000000 + '\n')
+    f.write('>after\n' + 'ACGT' * 100 + '\n')
+" $WORK/huge.fa
+"$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence $WORK/huge.fa > $WORK/huge.out 2> $WORK/huge.err
+check "read over the 128 MiB message limit exits with EX_DATAERR" 65 $?
+check "reads before the oversized one are classified" before "$(cut -f2 $WORK/huge.out | tr '\n' ' ' | xargs)"
+rm -f $WORK/huge.fa
+# Kill the server while the client waits on a quiet pipe.
+( gzip -dc $READS | head -4; sleep 60 ) | "$CLIENT" --port $ERR_PORT --host-ip 127.0.0.1 --sequence - > /dev/null 2>&1 &
+QUIET_CLIENT=$!
+sleep 2
+kill -9 $SERVER_PID
+wait $SERVER_PID 2> /dev/null
+trap - EXIT
+QUIET_RC=124
+for i in $(seq 1 15); do
+    if ! kill -0 $QUIET_CLIENT 2> /dev/null; then wait $QUIET_CLIENT; QUIET_RC=$?; break; fi
+    sleep 1
+done
+[ $QUIET_RC -eq 124 ] && kill $QUIET_CLIENT 2> /dev/null
+check "client on a quiet pipe exits UNAVAILABLE when the server dies (124 = still waiting)" 14 $QUIET_RC
+
 # Translated search against a tiny synthetic protein database, built on
 # first use by make_protein_db.sh (needs kraken2-build and python3).
 PROT_DB=tinyprot

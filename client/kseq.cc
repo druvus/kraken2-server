@@ -1,4 +1,5 @@
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -26,14 +27,14 @@ struct FastReader::Impl
 FastReader::FastReader(std::string filename)
     : m_filename(filename), m_impl(new Impl)
 {
-    FILE *instream = (filename == "-") ? stdin : fopen(filename.c_str(), "r");
-    if (instream == nullptr) {
-        throw std::runtime_error(
-            "Cannot open " + filename + ": " + std::strerror(errno));
-    }
-    m_impl->fp = gzdopen(fileno(instream), "r");
+    // zlib owns the file descriptor and closes it in gzclose.
+    errno = 0;
+    m_impl->fp = (filename == "-") ? gzdopen(fileno(stdin), "r")
+                                   : gzopen(filename.c_str(), "r");
     if (m_impl->fp == nullptr) {
-        throw std::runtime_error("Cannot open " + filename + " for reading.");
+        throw std::runtime_error(
+            "Cannot open " + filename + ": " +
+            (errno != 0 ? std::strerror(errno) : "out of memory"));
     }
     m_impl->seq = kseq_init(m_impl->fp);
 }
@@ -59,6 +60,22 @@ int FastReader::read(Kraken2SequenceRequest& rec) {
         return rtn;
     }
     else {
+        // Once a file has given FASTQ records, a record without qualities
+        // means the file ended part way through a record: kseq returns
+        // the partial record as FASTA. An empty record in the middle of
+        // the file is allowed.
+        if (m_seq->qual.l > 0) {
+            m_fastq = true;
+        }
+        else if (m_fastq && (m_seq->seq.l > 0 || ks_eof(m_seq->f))) {
+            std::cerr << m_filename << ": record "
+                      << (m_seq->name.s ? m_seq->name.s : "?")
+                      << " has no quality string; the file appears to be truncated; stopping."
+                      << std::endl;
+            rec.Clear();
+            m_last_status = -2;
+            return -2;
+        }
         m_last_status = rtn;
         // Only the fields the server uses are sent: id, sequence, qualities
         // and format. The full header line and a text rendering of the
@@ -123,7 +140,8 @@ int FastReader::read_pairs(std::vector<Kraken2SequenceRequest> &seqs, int batch_
             seqs.push_back(std::move(rec));
         }
         else {
-            if (got1 != got2) {
+            // Different lengths, not a read error in one of the files.
+            if (got1 != got2 && !failed() && !mate_reader.failed()) {
                 mismatched = true;
             }
             break;
