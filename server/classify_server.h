@@ -100,6 +100,9 @@ struct BatchResults {
    Kraken2SequenceResultMulti k2results;
    taxon_counters_t taxon_counters;
    ClassificationStats stats = {0, 0, 0};
+   // Set on the marker a pool task sends in place of a batch it could not
+   // classify; the writer discards it and every later batch.
+   bool failed = false;
 };
 
 
