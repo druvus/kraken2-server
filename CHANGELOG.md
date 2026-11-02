@@ -33,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it was stopped during a load that then succeeded. It now waits for the
   load and exits 0.
 
+### Changed
+- The documentation was checked against the code. The README now covers
+  the client's exit statuses 7 and 9 and corrupt gzip input, the server's
+  behaviour when its database fails to load and its per-stream memory
+  limits, the memory a long read needs, what the parity test covers and
+  needs, and v0.2.2 benchmarks on Linux. `python/README.md` covers
+  `--wait`, `on_message`, the input the readers accept and the test setup.
+  `docs/MULTI_DB.md` gives its status, and corrects the note that bioconda
+  does not ship kraken2's `merge` program.
+
 ## [v0.2.2] - 2026-11-02
 ### Fixed
 - A stream hung forever with very long reads (about 30 Mb and more, such as

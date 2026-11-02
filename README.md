@@ -88,7 +88,8 @@ classified flag, read id (with `/1` and `/2` stripped for pairs), taxonomy
 id, sequence length (`len1|len2` for pairs), and the minimizer hit list with
 `A` for ambiguous spans, `|:|` between mates and `-:-` between reading
 frames. Results arrive in the order the reads were sent, whatever the
-number of server threads.
+number of server threads. Read ids are passed through byte for byte,
+including bytes that are not valid UTF-8.
 
 The report written with `--report` is a kraken2 report with one header line
 added before the standard columns. `--report-kmer` on the server adds the
@@ -116,13 +117,19 @@ k-mer and distinct k-mer columns.
 Short options are accepted in either case (`-d` or `-D`). `--translated-search`
 is accepted for compatibility; protein databases are detected from `opts.k2d`.
 
-Ctrl-C, SIGTERM or `kraken2_client --shutdown` stop the server. Open
-streams get 10 seconds to finish and are then cancelled; a second signal
-exits at once, also while the database is still loading. The server
-exits with 0 after a shutdown, 69 if it cannot listen on the address
-(for example, the port is in use), 78 if the TLS files cannot be read,
-and 74 if the database failed to load. Startup errors are reported before
-the database is loaded.
+Ctrl-C, SIGTERM, SIGQUIT or `kraken2_client --shutdown` (when the server
+was started with `--allow-remote-shutdown`) stop the server. Open streams
+get 10 seconds to finish and are then cancelled. A shutdown requested while
+the database is loading waits for the load to finish; a second signal exits
+at once with 128 plus the signal number (130 for Ctrl-C).
+
+The server exits with 0 after a shutdown, 69 if it cannot listen on the
+address (for example, the port is in use), 78 if the TLS files cannot be
+read, and 74 if the database failed to load. The first two are reported
+straight away, before the database is loaded. A server whose database
+fails to load keeps running and answers every request with an error
+(`kraken2_client` exits 9, `k2client` 69) until it is stopped, so check
+its log or its exit status.
 
 ### Client options
 
@@ -145,9 +152,9 @@ Exit status is 0 on success, or:
 | 66 | an input file cannot be opened |
 | 69 | the server cannot be reached |
 | 73 | the report file cannot be written |
-| 74 | an input file cannot be read or parsed (including a FASTQ file cut off part way through a record), or standard output cannot be written |
+| 74 | an input file cannot be read or parsed (a FASTQ file cut off part way through a record, a gzip file that is truncated or corrupt), or standard output cannot be written |
 | 76 | the server completed the stream with fewer results than reads sent |
-| 13, 14 | gRPC status of a failed stream: the server could not classify a batch (13), or went away (14) |
+| 7, 9, 13, 14 | gRPC status of a failed request: remote shutdown refused (7), the server's database failed to load (9), the server could not classify a batch (13), or the server went away or stopped answering (14) |
 
 In every failure the lines already printed are complete results in input
 order. A client started while the server is still loading its database
@@ -159,8 +166,17 @@ The hash table is read into RAM by default. `--memory-mapping` maps the
 files instead, so the operating system page cache is shared with other
 processes using the same database (for example the `kraken2` program) and
 a large database starts serving before it is fully paged in. Each stream
-buffers at most twice the thread count in request batches, so a fast
-client cannot make the server hold its whole input in memory.
+holds at most twice the thread count in request batches on the
+classification threads, and four times the thread count including batches
+classified and waiting to be written, so neither a fast client nor one
+that stops reading results can make the server hold its whole input in
+memory.
+
+Very long reads need memory in proportion to their length while they are
+classified: with one classification thread, a 90 Mb contig raised the
+server's memory by about 31 bytes per base (2.8 GB), counting the request
+messages it held meanwhile. Working buffers larger than 64 MB are released
+after the read, so the server does not keep that memory.
 
 The clients bound their buffering in bytes as well as reads, so memory use
 does not grow with read length or input size: request messages hold at
@@ -314,11 +330,22 @@ client output with the `kraken2` and `k2` programs from the same Kraken2
 version on small databases:
 
 * the virus-zymo nucleotide test database (downloaded on first use):
-  single-end, paired-end, mismatched pairs, empty input, output order;
+  single-end, paired-end, mismatched pairs, empty input, output order, and
+  reports with the k-mer columns (`--report-kmer` against
+  `kraken2 --report-minimizer-data`);
 * Illumina-style pairs and long reads built from the test reads by
   `testing/make_longread_testdata.py`: CASAVA and `/1` `/2` names, mates
-  shorter than the k-mer size, reads up to 5 Mb, a batch over the gRPC
-  message limit, and a server lost mid-stream;
+  shorter than the k-mer size, reads up to 5 Mb, and a batch over the gRPC
+  message limit;
+* input edge cases: read ids that are not UTF-8, truncated FASTQ and gzip
+  files, concatenated gzip members, gzip with trailing padding, gzip on
+  standard input, and a read over the message limit;
+* client behaviour: exit statuses for lost input and output, results
+  within a few seconds of reads fed slowly on standard input, keepalive
+  against a frozen (`SIGSTOP`) server, and a server lost mid-stream;
+* server behaviour: results while the client keeps its stream open,
+  startup errors (port in use, unreadable TLS files) reported without
+  waiting for the load, shutdown with an open stream, and exit statuses;
 * a synthetic protein database built by `testing/make_protein_db.sh`:
   translated search, single-end and paired-end;
 * two synthetic nucleotide databases sharing a species, built by
@@ -327,9 +354,15 @@ version on small databases:
 * malformed quality strings sent with `testing/raw_client`, TLS, mutual TLS,
   the refused remote shutdown, and clean exit on SIGTERM.
 
-It needs `kraken2`, `kraken2-build`, `k2`, `seqkit`, `openssl` and `python3`
-on the `PATH`; sections whose tools are missing are skipped with a notice.
-`python/tests` checks the Python client against the C++ client with pytest.
+It needs `kraken2`, `seqkit`, `python3`, `gzip` and `curl` on the `PATH`.
+Sections that also need `kraken2-build`, `k2`, `openssl` or
+`testing/raw_client` (`-DBUILD_TEST_TOOLS=ON`) are skipped with a notice
+when these are missing. It listens on the port given as its argument
+(default 8123) and the eight ports after it. `SERVER`, `CLIENT` and
+`RAW_CLIENT` select other builds, for example sanitizer builds.
+
+`python/tests` checks the Python client against the C++ client with
+pytest; see `python/README.md`.
 
 Both CI configurations (`.github/workflows/build.yml` for the GitHub
 mirror, `.gitlab-ci.yml` for the ONT GitLab) build on Linux with warnings
@@ -349,6 +382,20 @@ commit, diff those functions against upstream, rebuild, and run
 is the definition of "still compatible".
 
 ## Benchmarks
+
+v0.2.2 on a 4-core Linux virtual machine, server with 3 classification
+threads and the C++ client on the same machine, compared with `kraken2`
+with 3 threads on the same files (output identical):
+
+| input | server / Gbp per min | `kraken2` / Gbp per min |
+|---|---|---|
+| 1,017,000 Illumina-style pairs, 2 × 150 bp (300 Mbp) | 2.1 | 2.7–2.9 |
+| 17,600 nanopore reads, about 42 kb (743 Mbp) | 3.0 | 2.9 |
+
+For short reads the client, which shares the four cores, is most of the
+difference; the server's own work outside classification is a few per
+cent. The C++ client peaked at 186 MB of memory on the 1.5 GB long-read
+file.
 
 Server throughput on 73,700 nanopore reads (198 Mbp, the virus-zymo test
 reads repeated twenty times) with one client on the same machine, v0.2.0,
