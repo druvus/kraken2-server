@@ -238,6 +238,15 @@ int RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
     builder.SetResourceQuota(rq);
     builder.RegisterService(&service);
+    // Accept client keepalive pings every 10 s or more while a stream is
+    // quiet (the default refuses pings closer than 5 minutes), and ping
+    // clients the same way so a vanished client's stream ends.
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MIN_RECV_PING_INTERVAL_WITHOUT_DATA_MS, 9000);
+    builder.AddChannelArgument(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIME_MS, 60000);
+    builder.AddChannelArgument(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 20000);
+    // current gRPC times keepalive pings out with this (no public macro)
+    builder.AddChannelArgument("grpc.http2.ping_timeout_ms", 20000);
     // allow 128Mb messages
     builder.SetMaxSendMessageSize(128 * 1024 * 1024);
     builder.SetMaxMessageSize(128 * 1024 * 1024);

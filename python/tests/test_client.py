@@ -14,8 +14,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
+import grpc
 import pytest
 
 from kraken2_client import (TLS, Classification, Client, InputError, ShutdownRefused, read_fastx, read_pairs)
@@ -257,6 +259,62 @@ def test_cli_truncated_fastq(server, tmp_path):
     assert out.count("\n") == complete
     # the report covers the records that were classified, as with the C++ client
     assert report.read_text().startswith("% of Seqs")
+
+
+def test_slow_source_gets_results_promptly(server):
+    """Records that arrive one per second are classified as they come."""
+    recs = list(read_fastx(READS))[:5]
+
+    def slowly():
+        for r in recs:
+            yield r
+            time.sleep(1)
+
+    start = time.monotonic()
+    arrivals = []
+    with Client("127.0.0.1", server.port) as c:
+        for hit in c.classify(slowly()):
+            arrivals.append(time.monotonic() - start)
+    assert len(arrivals) == 5
+    assert arrivals[0] < 3, arrivals
+
+
+def test_keepalive_ends_stream_to_frozen_server():
+    """A server that stops answering is given up on after the keepalive."""
+    import signal
+    s = Server()
+    rec = next(iter(read_fastx(READS)))
+
+    def one_then_quiet():
+        yield rec
+        time.sleep(120)
+
+    outcome = []
+
+    def drain(hits):
+        try:
+            list(hits)
+            outcome.append(None)
+        except grpc.RpcError as e:
+            outcome.append(e)
+
+    try:
+        with Client("127.0.0.1", s.port, keepalive=10) as c:
+            c.wait_ready(poll_seconds=0.5, timeout=60)
+            hits = c.classify(one_then_quiet())
+            next(hits)
+            os.kill(s.proc.pid, signal.SIGSTOP)
+            # drain on a thread so that a missing keepalive fails the test
+            # instead of hanging it
+            t = threading.Thread(target=drain, args=(hits,), daemon=True)
+            t.start()
+            t.join(45)
+            assert outcome, "stream to the frozen server still open after 45 s"
+            assert isinstance(outcome[0], grpc.RpcError)
+            assert outcome[0].code() == grpc.StatusCode.UNAVAILABLE
+    finally:
+        os.kill(s.proc.pid, signal.SIGCONT)
+        s.stop()
 
 
 def test_results_arrive_in_input_order(server):

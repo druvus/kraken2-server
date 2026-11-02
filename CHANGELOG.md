@@ -48,6 +48,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported by the call; reading from `-` no longer closes standard input.
 - The report passed to `classify()` is written for the records that were
   classified also when the record source fails part way.
+- Reads that arrive slowly, for example piped from a running sequencer,
+  were only classified once a batch of thousands had arrived or the input
+  closed: the C++ client read through zlib's `gzread`, which fills its
+  whole buffer before returning, and both clients sent only full batches.
+  The C++ client now reads plain input as it arrives and decodes gzip
+  input with `inflate`, both clients send a partial batch after a second
+  without new reads, and the C++ client flushes each result message to
+  standard output. Each result now comes back within about a second.
+- A client could wait forever on a server that froze or a network that
+  dropped without a reset. Both clients ping the server after 60 s
+  without data on a stream (`--keepalive`, `keepalive=`) and give up after
+  20 s without an answer; the server accepts these pings and pings its
+  clients in the same way.
 
 ### Changed
 - The distinct k-mer estimate (a HyperLogLog sketch per taxon) is computed

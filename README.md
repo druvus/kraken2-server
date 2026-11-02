@@ -61,6 +61,16 @@ as with `kraken2 --paired`, and interleaved pairs in one file are not
 supported. Pairing is decided per read, so one server serves single-end and
 paired-end clients at the same time.
 
+Reads can be piped in as they are produced, for example by a running
+sequencer: `--sequence -` reads standard input (plain or gzipped), and
+reads that arrive slowly are sent once nothing more has arrived for a
+second, so each result comes back within about a second of its read
+rather than when a batch of thousands is full. Results are written to
+standard output as they arrive. During a stream the client pings the
+server after 60 seconds without data (`--keepalive`) and exits with
+status 14 if no answer comes within 20 seconds, so a frozen server or a
+network that drops without a reset does not leave it waiting forever.
+
 Without `--sequence` the client prints the server's cumulative report over
 every read it has classified since it started (unless the server runs with
 `--no-stats`).
@@ -123,6 +133,7 @@ the database is loaded.
 | `-r, --report PATH` | write the kraken2 style report here |
 | `-i, --host-ip ADDR`, `-p, --port N` | server address (default localhost:8080) |
 | `-k, --shutdown` | ask the server to stop (needs `--allow-remote-shutdown` on the server) |
+| `--keepalive N` | ping the server after N seconds without data, give up after 20 s without an answer (default 60, minimum 10, 0 disables) |
 | `-t, --tls`, `--tls-ca`, `--tls-cert`, `--tls-key`, `--tls-server-name` | TLS, see "Security" |
 
 Exit status is 0 on success, or:

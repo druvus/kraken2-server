@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <limits>
 #include <mutex>
@@ -64,6 +65,31 @@ public:
         queue_.pop();
         not_full_.notify_one();
         return item;
+    }
+
+    // Blocking pop with a timeout. Returns an empty optional when nothing
+    // arrived within the timeout, or once the queue has been closed and
+    // drained; drained() tells the two apart.
+    template <typename Rep, typename Period>
+    std::optional<T> pop_wait_for(const std::chrono::duration<Rep, Period> &timeout)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        not_empty_.wait_for(lock, timeout, [this] { return !queue_.empty() || closed_; });
+        if (queue_.empty())
+        {
+            return std::nullopt;
+        }
+        std::optional<T> item(std::move(queue_.front()));
+        queue_.pop();
+        not_full_.notify_one();
+        return item;
+    }
+
+    // True once the queue has been closed and every item consumed.
+    bool drained() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_ && queue_.empty();
     }
 
     // Blocking push. Waits while the queue is at capacity. Items pushed

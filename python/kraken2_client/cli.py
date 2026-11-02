@@ -37,12 +37,17 @@ def main(argv=None):
     ap.add_argument("--tls-key", help="PEM client key for --tls-cert")
     ap.add_argument("--tls-server-name", help="name to verify in the server certificate")
     ap.add_argument("--wait", type=float, default=None, help="seconds to wait for the server database to load (default: forever)")
+    ap.add_argument("--keepalive", type=int, default=60,
+                    help="ping the server after this many seconds without data and give up if it does not "
+                         "answer within 20 s; 0 disables (default: 60, minimum 10)")
     args = ap.parse_args(argv)
 
     if args.sequence2 and not args.sequence:
         ap.error("--sequence2 requires --sequence")
     if bool(args.tls_cert) != bool(args.tls_key):
         ap.error("--tls-cert and --tls-key must be given together")
+    if args.keepalive and args.keepalive < 10:
+        ap.error("--keepalive must be 0 or at least 10 seconds")
 
     tls = None
     if args.tls or args.tls_ca or args.tls_cert or args.tls_server_name:
@@ -61,7 +66,7 @@ def main(argv=None):
             return EX_NOINPUT
 
     try:
-        with Client(args.host_ip, args.port, tls) as client:
+        with Client(args.host_ip, args.port, tls, keepalive=args.keepalive) as client:
             if args.shutdown:
                 try:
                     ok = client.shutdown()

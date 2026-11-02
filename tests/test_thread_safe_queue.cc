@@ -41,6 +41,25 @@ TEST_CASE("ThreadSafeQueue pop_wait returns empty only after close and drain")
     CHECK_FALSE(q.pop_wait().has_value());
 }
 
+TEST_CASE("ThreadSafeQueue pop_wait_for times out, then reports drained after close")
+{
+    ThreadSafeQueue<int> q;
+    auto start = std::chrono::steady_clock::now();
+    CHECK_FALSE(q.pop_wait_for(std::chrono::milliseconds(50)).has_value());
+    CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(50));
+    CHECK_FALSE(q.drained());
+    q.push(7);
+    auto item = q.pop_wait_for(std::chrono::milliseconds(50));
+    REQUIRE(item.has_value());
+    CHECK(*item == 7);
+    q.push(8);
+    q.close();
+    CHECK_FALSE(q.drained());
+    CHECK(*q.pop_wait_for(std::chrono::milliseconds(50)) == 8);
+    CHECK_FALSE(q.pop_wait_for(std::chrono::milliseconds(50)).has_value());
+    CHECK(q.drained());
+}
+
 TEST_CASE("ThreadSafeQueue close wakes a blocked consumer")
 {
     ThreadSafeQueue<int> q;
