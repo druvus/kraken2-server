@@ -20,7 +20,9 @@ by a newer `grpcio-tools` refuse to load with an older `grpcio`.
 
 ## Command line
 
-`k2client` takes the same options as `kraken2_client`:
+`k2client` takes the same options as `kraken2_client` and exits with the
+same statuses for input and output errors (65, 66, 73, 74; see the main
+README). Any failed request to the server exits 69.
 
 ```
 k2client --port 8080 --sequence reads.fq.gz --report report.txt > classifications.txt
@@ -57,7 +59,14 @@ of at most 2000 records or 8 MB, and at most 256 MB (or 64,000 records)
 are awaiting results, so memory use is bounded whatever the read length.
 An exception raised by the iterable, such as the `ValueError` from
 `read_pairs` on inputs of different lengths, is raised by `classify()`
-after the results for the records already sent have been yielded. A
+after the results for the records already sent have been yielded, and
+after the report for those records has been written.
+
+`read_fastx()` and `read_pairs()` open their files at once, so a missing
+file raises `OSError` from the call itself. A FASTQ file that ends part
+way through a record, or a truncated gzip file, raises `InputError` (a
+`ValueError`) when the bad record is reached. Reading from `-` leaves
+standard input open. A
 `grpc.RpcError` with status `INTERNAL` means the server could not
 classify a batch and the results are incomplete; `UNAVAILABLE` means the
 server went away.
