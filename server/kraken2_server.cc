@@ -1,7 +1,10 @@
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <memory>
+#include <pthread.h>
 #include <sysexits.h>
+#include <thread>
 
 #include <grpc/grpc.h>
 #include <grpc++/server.h>
@@ -35,16 +38,41 @@ using kraken2proto::Kraken2Service;
 
 
 
-// Shared between the signal handler, the RemoteShutdown RPC and RunServer.
+// Open streams get this long to finish after a shutdown request before
+// gRPC cancels them.
+static const int kShutdownGraceSeconds = 10;
+
+// Shared between the signal thread, the RemoteShutdown RPC and RunServer.
 // The promise may only be fulfilled once, so a flag guards against a second
 // signal or a shutdown request arriving after Ctrl-C.
 static std::promise<void> exit_promise;
 static std::atomic<bool> exit_flag{false};
-static std::promise<void> *exit_requested = &exit_promise;
 
 static void RequestExit() {
     if (!exit_flag.exchange(true)) {
-        exit_requested->set_value();
+        exit_promise.set_value();
+    }
+}
+
+// SIGINT, SIGTERM and SIGQUIT are blocked in every thread and taken here
+// with sigwait, so the shutdown request runs in an ordinary thread rather
+// than in a signal handler. The first signal starts a graceful shutdown; a
+// second one exits at once, also while the database is still loading.
+static void HandleSignals(sigset_t signals) {
+    int received = 0;
+    while (true) {
+        int sig = 0;
+        if (sigwait(&signals, &sig) != 0) {
+            continue;
+        }
+        if (++received == 1) {
+            std::cerr << "Received signal " << sig << "; shutting down. "
+                      << "Send it again to exit at once." << std::endl;
+            RequestExit();
+        } else {
+            std::cerr << "Received signal " << sig << " again; exiting now." << std::endl;
+            std::_Exit(128 + sig);
+        }
     }
 }
 
@@ -155,7 +183,14 @@ private:
 
 };
 
-void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
+/**
+ * @brief Start listening, start loading the database, and serve until a
+ *        shutdown is requested.
+ *
+ * @return EX_OK after a requested shutdown, EX_CONFIG if the TLS files
+ *         cannot be read, EX_UNAVAILABLE if the address cannot be bound.
+ */
+int RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     std::string server_address = opts.host + ":" + std::to_string(opts.port);
     ServiceImpl service(opts, classifier);
     // Sets the max number of concurrent requests
@@ -186,7 +221,7 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
         }
         catch (const std::exception &ex) {
             std::cerr << "Cannot configure TLS: " << ex.what() << std::endl;
-            return;
+            return EX_CONFIG;
         }
         credentials = grpc::SslServerCredentials(ssl_opts);
         std::cout << "TLS enabled"
@@ -210,22 +245,21 @@ void RunServer(Options opts, Kraken2ServerClassifier *classifier) {
     // Shared pointer so graceful shutdown can be invoked.
     std::shared_ptr<Server> server(builder.BuildAndStart());
     if (server == nullptr) {
-        std::cout << "Failed to start server on " << server_address
-                  << ". See above for more details." << std::endl;     
-    } else {
-        std::cout << "Server listening on " << server_address
-                  << ". Press Ctrl-C to end." << std::endl;
-        // handle interrupts
-        auto handler = [](int s) { RequestExit(); };
-        std::signal(SIGINT, handler);
-        std::signal(SIGTERM, handler);
-        std::signal(SIGQUIT, handler);
-
-        // block until exit request is set
-        auto f = exit_requested->get_future();
-        f.wait();
-        server->Shutdown();
+        std::cerr << "Failed to start server on " << server_address
+                  << ". See above for more details." << std::endl;
+        return EX_UNAVAILABLE;
     }
+    std::cout << "Server listening on " << server_address
+              << ". Press Ctrl-C to end." << std::endl;
+    classifier->StartLoading();
+
+    // block until a shutdown is requested, by a signal or RemoteShutdown
+    exit_promise.get_future().wait();
+    std::cerr << "Shutting down; open streams have " << kShutdownGraceSeconds
+              << " s to finish before they are cancelled." << std::endl;
+    server->Shutdown(std::chrono::system_clock::now() +
+                     std::chrono::seconds(kShutdownGraceSeconds));
+    return EX_OK;
 }
 
 
@@ -294,8 +328,23 @@ void ParseCommandLine(int argc, char **argv, Options &opts) {
 int main(int argc, char **argv) {
     Options opts;
     ParseCommandLine(argc, argv, opts);
-    std::unique_ptr<Kraken2ServerClassifier> classifier(new Kraken2ServerClassifier(opts));
-    RunServer(opts, classifier.get());
 
+    // Block the termination signals before any thread starts, so every
+    // thread inherits the mask and only HandleSignals receives them.
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGINT);
+    sigaddset(&signals, SIGTERM);
+    sigaddset(&signals, SIGQUIT);
+    pthread_sigmask(SIG_BLOCK, &signals, nullptr);
+    std::thread(HandleSignals, signals).detach();
+
+    std::unique_ptr<Kraken2ServerClassifier> classifier(new Kraken2ServerClassifier(opts));
+    int status = RunServer(opts, classifier.get());
+    if (status != EX_OK) {
+        return status;
+    }
+    // Waits for a database load still in progress (the classifier's
+    // destructor joins the loader); a second signal exits at once.
     return classifier->index_available ? EX_OK : EX_IOERR;
 }

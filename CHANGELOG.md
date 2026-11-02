@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Fixed
+- SIGTERM and Ctrl-C did not stop the server while a client held a stream
+  open, for example one fed by a running sequencer. Open streams now get
+  10 seconds and are then cancelled, and a second signal exits at once.
+- A port already in use or unreadable TLS files were reported at once,
+  but the server exited only after the database had finished loading. The
+  database is now loaded after the server is listening, and these errors
+  exit immediately with 69 and 78.
+- Signals are taken on a dedicated thread with `sigwait` instead of a
+  signal handler that was not async-signal-safe.
+
 ## [v0.2.1] - 2026-10-28
 ### Fixed
 - The C++ client hung forever when the server went away mid-stream with

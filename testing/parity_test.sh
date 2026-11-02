@@ -186,6 +186,44 @@ wait $SERVER_PID
 check "server exit code" 0 $?
 trap - EXIT
 
+# Startup errors are reported without waiting for the database to load,
+# and a shutdown does not wait indefinitely for an open stream. --wait
+# stands in for a slow load of a large database.
+echo "+++ Startup errors and shutdown +++"
+START_PORT=$((PORT + 3))
+"$SERVER" --db $DB --host-ip 127.0.0.1 --port $START_PORT > $WORK/server_holder.log 2>&1 &
+HOLDER_PID=$!
+trap 'kill $HOLDER_PID 2> /dev/null' EXIT
+for i in $(seq 1 60); do "$CLIENT" --port $START_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break; sleep 1; done
+T0=$SECONDS
+"$SERVER" --db $DB --host-ip 127.0.0.1 --port $START_PORT --wait 30 > $WORK/server_dup.log 2>&1
+check "port in use exits with EX_UNAVAILABLE" 69 $?
+check "port in use exits without waiting for the load" 1 "$([ $((SECONDS - T0)) -lt 10 ] && echo 1)"
+T0=$SECONDS
+"$SERVER" --db $DB --host-ip 127.0.0.1 --port $((PORT + 4)) --wait 30 \
+    --tls-cert $WORK/missing.crt --tls-key $WORK/missing.key > $WORK/server_badtls.log 2>&1
+check "unreadable TLS files exit with EX_CONFIG" 78 $?
+check "TLS error exits without waiting for the load" 1 "$([ $((SECONDS - T0)) -lt 10 ] && echo 1)"
+# A client reading from a pipe that stays quiet keeps its stream open, as a
+# client fed by a running sequencer does.
+( gzip -dc $READS | head -4; sleep 60 ) | "$CLIENT" --port $START_PORT --host-ip 127.0.0.1 --sequence - > /dev/null 2>&1 &
+QUIET_CLIENT=$!
+sleep 2
+T0=$SECONDS
+kill -TERM $HOLDER_PID
+wait $HOLDER_PID
+check "server exits on SIGTERM with an open stream" 0 $?
+check "open stream cancelled within the 10 s grace period" 1 "$([ $((SECONDS - T0)) -lt 15 ] && echo 1)"
+trap - EXIT
+kill $QUIET_CLIENT 2> /dev/null
+"$SERVER" --db $DB --host-ip 127.0.0.1 --port $((PORT + 4)) --wait 60 > $WORK/server_slowload.log 2>&1 &
+SLOW_PID=$!
+sleep 2
+T0=$SECONDS
+kill -TERM $SLOW_PID; sleep 1; kill -TERM $SLOW_PID
+wait $SLOW_PID
+check "second SIGTERM during a load exits at once" 1 "$([ $((SECONDS - T0)) -lt 10 ] && echo 1)"
+
 # Translated search against a tiny synthetic protein database, built on
 # first use by make_protein_db.sh (needs kraken2-build and python3).
 PROT_DB=tinyprot

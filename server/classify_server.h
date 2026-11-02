@@ -111,12 +111,19 @@ public:
     std::atomic<bool> index_broken{false};
 
     /**
-     * @brief Construct a new Kraken 2 Server Classifier. Starts the thread
-     *        pool and begins loading the database asynchronously. The
-     *        database is loaded only once and reused for all requests.
+     * @brief Construct a new Kraken 2 Server Classifier and start its
+     *        thread pool. The database is not loaded until StartLoading().
      */
     Kraken2ServerClassifier(Options &options);
     ~Kraken2ServerClassifier();
+
+    /**
+     * @brief Begin loading the database in the background. Called once the
+     *        server is listening, so a startup error (port in use, bad TLS
+     *        files) is reported without first waiting for a long load.
+     *        The database is loaded only once and reused for all requests.
+     */
+    void StartLoading();
 
     /**
      * @brief Load kraken2 index options, taxonomy and hash table.
