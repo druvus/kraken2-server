@@ -13,8 +13,10 @@ for read pairs; quals is an empty string for FASTA. Results are yielded in the
 order the records were sent.
 """
 
+import collections
 import gzip
 import io
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Iterable, Iterator, Optional, Tuple, Union
@@ -24,8 +26,8 @@ import grpc
 from . import Kraken2_pb2 as pb
 from . import Kraken2_pb2_grpc as pb_grpc
 
-__all__ = ["Client", "Classification", "Record", "PairedRecord", "read_fastx", "TLS",
-           "ServerNotReady", "ShutdownRefused"]
+__all__ = ["Client", "Classification", "Record", "PairedRecord", "read_fastx", "read_pairs",
+           "TLS", "InputError", "ServerNotReady", "ShutdownRefused"]
 
 Record = Tuple[str, str, str]
 PairedRecord = Tuple[str, str, str, str, str]
@@ -45,6 +47,11 @@ class ServerNotReady(RuntimeError):
 
 class ShutdownRefused(PermissionError):
     """The server was not started with --allow-remote-shutdown."""
+
+
+class InputError(ValueError):
+    """An input file could not be parsed, for example a FASTQ file that
+    ends part way through a record or a truncated gzip file."""
 
 
 @dataclass
@@ -91,7 +98,7 @@ class _InFlight:
 
     def __init__(self):
         self._cond = threading.Condition()
-        self._sizes = []   # bytes of each record in flight, oldest first
+        self._sizes = collections.deque()   # bytes of each record in flight, oldest first
         self._bytes = 0
         self._closed = False
 
@@ -106,7 +113,7 @@ class _InFlight:
     def release(self):
         with self._cond:
             if self._sizes:
-                self._bytes -= self._sizes.pop(0)
+                self._bytes -= self._sizes.popleft()
             self._cond.notify_all()
 
     def close(self):
@@ -244,10 +251,12 @@ class Client:
                     summary.append(result.summary)
         finally:
             in_flight.close()
-        if failure:
-            raise failure[0]
+        # The report covers the records that were classified, also when
+        # the record source failed part way.
         if report is not None:
             report.write("".join(summary))
+        if failure:
+            raise failure[0]
 
 
 def _record_bytes(rec) -> int:
@@ -271,7 +280,6 @@ def _fill(msg, read_id: str, seq: str, quals: str):
 
 def _open_text(path: str):
     if path == "-":
-        import sys
         return sys.stdin
     f = open(path, "rb")
     if f.read(2) == b"\x1f\x8b":
@@ -282,10 +290,20 @@ def _open_text(path: str):
 
 
 def read_fastx(path: str) -> Iterator[Record]:
-    """Yield (id, seq, quals) from a FASTA or FASTQ file, plain or gzipped,
-    or from stdin when path is "-". The id is the header up to the first
-    whitespace. quals is empty for FASTA."""
-    with _open_text(path) as f:
+    """Return an iterator of (id, seq, quals) from a FASTA or FASTQ file,
+    plain or gzipped, or from stdin when path is "-". The id is the header
+    up to the first whitespace. quals is empty for FASTA.
+
+    The file is opened at once, so a missing file raises OSError here
+    rather than when the records are first read. A FASTQ record cut short
+    (a truncated file) or a truncated gzip file raises InputError when it
+    is reached. Standard input is left open."""
+    f = _open_text(path)
+    return _fastx_records(f, path, close=f is not sys.stdin)
+
+
+def _fastx_records(f, path: str, close: bool) -> Iterator[Record]:
+    try:
         header = None
         seq_lines = []
         for line in f:
@@ -294,9 +312,12 @@ def read_fastx(path: str) -> Iterator[Record]:
                 continue
             if line[0] == "@" and header is None:
                 read_id = line[1:].split(None, 1)[0]
-                seq = next(f).rstrip("\n")
-                next(f)  # '+'
-                quals = next(f).rstrip("\n")
+                seq = f.readline().rstrip("\n")
+                plus = f.readline()
+                quals = f.readline().rstrip("\n")
+                if not plus.startswith("+") or len(quals) != len(seq):
+                    raise InputError(
+                        "%s: record %s is incomplete; the file appears to be truncated" % (path, read_id))
                 yield (read_id, seq, quals)
             elif line[0] == ">":
                 if header is not None:
@@ -307,12 +328,24 @@ def read_fastx(path: str) -> Iterator[Record]:
                 seq_lines.append(line)
         if header is not None:
             yield (header, "".join(seq_lines), "")
+    except EOFError as e:
+        # gzip raises EOFError for a compressed stream that ends early
+        raise InputError("%s: %s" % (path, e)) from None
+    finally:
+        if close:
+            f.close()
 
 
 def read_pairs(path1: str, path2: str) -> Iterator[PairedRecord]:
-    """Yield paired records from two files matched by position. Stops at the
-    end of the shorter file and raises ValueError if the lengths differ."""
-    it1, it2 = read_fastx(path1), read_fastx(path2)
+    """Return an iterator of paired records from two files matched by
+    position. Both files are opened at once. Stops at the end of the
+    shorter file and raises ValueError if the lengths differ."""
+    it1 = read_fastx(path1)
+    it2 = read_fastx(path2)
+    return _pairs(it1, it2, path1, path2)
+
+
+def _pairs(it1, it2, path1: str, path2: str) -> Iterator[PairedRecord]:
     while True:
         r1 = next(it1, None)
         r2 = next(it2, None)
