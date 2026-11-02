@@ -186,6 +186,26 @@ wait $SERVER_PID
 check "server exit code" 0 $?
 trap - EXIT
 
+# The k-mer and distinct k-mer report columns (server --report-kmer) must
+# match kraken2 --report-minimizer-data, for single-end and paired reads.
+echo "+++ Report with k-mer columns +++"
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --report-minimizer-data \
+    --report $WORK/ref_kmer.report --output /dev/null $READS > /dev/null 2>&1
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --report-minimizer-data --paired \
+    --report $WORK/ref_kmer_p.report --output /dev/null $WORK/r1.fq.gz $WORK/r2.fq.gz > /dev/null 2>&1
+KMER_PORT=$((PORT + 5))
+"$SERVER" --allow-remote-shutdown --report-kmer --db $DB --host-ip 127.0.0.1 --port $KMER_PORT > $WORK/server_kmer.log 2>&1 &
+SERVER_PID=$!
+trap 'kill $SERVER_PID 2> /dev/null' EXIT
+for i in $(seq 1 60); do "$CLIENT" --port $KMER_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break; sleep 1; done
+"$CLIENT" --port $KMER_PORT --host-ip 127.0.0.1 --sequence $READS --report $WORK/kmer.report > /dev/null 2>&1
+check "k-mer report identical to kraken2 --report-minimizer-data" 0 "$(diff <(tail -n +2 $WORK/kmer.report) $WORK/ref_kmer.report | grep -c '^[<>]')"
+"$CLIENT" --port $KMER_PORT --host-ip 127.0.0.1 --sequence $WORK/r1.fq.gz --sequence2 $WORK/r2.fq.gz --report $WORK/kmer_p.report > /dev/null 2>&1
+check "paired k-mer report identical to kraken2 --report-minimizer-data" 0 "$(diff <(tail -n +2 $WORK/kmer_p.report) $WORK/ref_kmer_p.report | grep -c '^[<>]')"
+"$CLIENT" --port $KMER_PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+wait $SERVER_PID
+trap - EXIT
+
 # Startup errors are reported without waiting for the database to load,
 # and a shutdown does not wait indefinitely for an open stream. --wait
 # stands in for a slow load of a large database.

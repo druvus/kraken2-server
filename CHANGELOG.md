@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in flight before sending it, and no longer reports a read error in one
   of two paired files as mismatched lengths.
 
+### Changed
+- The distinct k-mer estimate (a HyperLogLog sketch per taxon) is computed
+  only with `--report-kmer`, which is the only report that shows it. The
+  server uses about 10% less CPU on short paired reads.
+- Per-thread scratch buffers larger than 64 MB are released after the
+  read that grew them. After four 90 Mb contigs the server holds 0.8 GB
+  instead of about 4.5 GB, and its peak drops from 6.4 to 5.3 GB.
+- The parity test compares `--report-kmer` reports with
+  `kraken2 --report-minimizer-data`.
+
 ## [v0.2.1] - 2026-10-28
 ### Fixed
 - The C++ client hung forever when the server went away mid-stream with
