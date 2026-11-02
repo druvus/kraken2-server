@@ -317,6 +317,76 @@ def test_keepalive_ends_stream_to_frozen_server():
         s.stop()
 
 
+def test_cli_read_id_not_utf8(server, tmp_path):
+    """A read id with a byte that is not UTF-8 is passed through unchanged."""
+    with gzip.open(READS, "rb") as f:
+        lines = f.read().split(b"\n")
+    lines[2000 * 4] = b"@caf\xe9_" + lines[2000 * 4][1:]
+    path = tmp_path / "latin1.fq"
+    path.write_bytes(b"\n".join(lines))
+    py = subprocess.run([sys.executable, "-m", "kraken2_client.cli", "--host-ip", "127.0.0.1",
+                         "--port", str(server.port), "--sequence", str(path)], capture_output=True)
+    cpp = subprocess.run([CPP_CLIENT, "--host-ip", "127.0.0.1", "--port", str(server.port),
+                          "--sequence", str(path)], capture_output=True)
+    assert py.returncode == 0, py.stderr
+    assert cpp.returncode == 0, cpp.stderr
+    assert py.stdout == cpp.stdout
+    assert b"caf\xe9_" in py.stdout
+
+
+def test_cli_flushes_results_to_a_pipe(server):
+    """Results reach a pipe as they arrive, without PYTHONUNBUFFERED."""
+    import select
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONUNBUFFERED"}
+    with gzip.open(READS, "rb") as f:
+        head = b"".join(f.readline() for _ in range(12))
+    p = subprocess.Popen([sys.executable, "-m", "kraken2_client.cli", "--host-ip", "127.0.0.1",
+                          "--port", str(server.port), "--sequence", "-"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
+    try:
+        p.stdin.write(head)
+        p.stdin.flush()
+        ready, _, _ = select.select([p.stdout], [], [], 5)
+        assert ready, "no result within 5 s while the input stayed open"
+    finally:
+        p.stdin.close()
+        p.wait(timeout=30)
+    assert p.returncode == 0
+
+
+def test_cli_reads_gzip_on_stdin_and_named_pipes(server, tmp_path):
+    ref = cpp_client(server.port, "--sequence", READS)
+    with open(READS, "rb") as f:
+        r = subprocess.run([sys.executable, "-m", "kraken2_client.cli", "--host-ip", "127.0.0.1",
+                            "--port", str(server.port), "--sequence", "-"], stdin=f, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ref
+    # a named pipe, as from process substitution (<(zcat reads.fq.gz)): not seekable
+    fifo = tmp_path / "reads.fifo"
+    os.mkfifo(fifo)
+
+    def feed():
+        with open(fifo, "wb") as w, gzip.open(READS, "rb") as src:
+            shutil.copyfileobj(src, w)
+
+    t = threading.Thread(target=feed, daemon=True)
+    t.start()
+    r = subprocess.run([sys.executable, "-m", "kraken2_client.cli", "--host-ip", "127.0.0.1",
+                        "--port", str(server.port), "--sequence", str(fifo)], capture_output=True, text=True)
+    t.join(10)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ref
+
+
+def test_read_fastx_corrupt_gzip_is_an_input_error(tmp_path):
+    data = bytearray(gzip.compress(b"@r1\nACGT\n+\nIIII\n" * 2000))
+    data[-8] ^= 0xFF   # CRC
+    gz = tmp_path / "crc.fq.gz"
+    gz.write_bytes(bytes(data))
+    with pytest.raises(InputError):
+        list(read_fastx(str(gz)))
+
+
 def test_results_arrive_in_input_order(server):
     ids = [r[0] for r in read_fastx(READS)]
     with Client("127.0.0.1", server.port) as c:

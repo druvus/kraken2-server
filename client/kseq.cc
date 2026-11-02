@@ -18,7 +18,8 @@
 // arrived or the pipe closes. Here plain input returns whatever one read()
 // delivers, and gzip input, any number of concatenated members, is decoded
 // with inflate as it arrives. The format is decided from the first two
-// bytes, on the first read.
+// bytes, on the first read. As with gzread, anything after a complete gzip
+// member that is not another member (zero padding, say) ends the input.
 struct Input
 {
     int fd = -1;
@@ -26,6 +27,9 @@ struct Input
     bool detected = false;
     bool gzip = false;
     bool in_member = false;   // part way through a gzip member
+    bool check_next = false;  // a member ended: is another one next?
+    bool finished = false;    // no further members
+    bool failed = false;      // a read error, corrupt data or a member cut short
     z_stream zs;
     unsigned char buf[65536];
     size_t pos = 0, len = 0;  // raw bytes read but not yet consumed
@@ -46,9 +50,29 @@ static ssize_t raw_read(int fd, void *p, size_t n)
     return r;
 }
 
-// kseq's read function: up to out_len bytes of text, 0 at the end of the
-// input, -1 on an error, a corrupt gzip stream or a truncated gzip member.
-static int input_read(Input *in, void *out, unsigned out_len)
+// After a gzip member ended, make at least two unconsumed bytes available
+// and say whether they start another member: 1 yes, 0 no (or the input
+// ended), -1 on a read error.
+static int next_is_member(Input *in)
+{
+    if (in->zs.avail_in < 2) {
+        size_t have = in->zs.avail_in;
+        memmove(in->buf, in->zs.next_in, have);
+        in->len = have;
+        while (in->len < 2) {
+            ssize_t r = raw_read(in->fd, in->buf + in->len, sizeof(in->buf) - in->len);
+            if (r < 0) return -1;
+            if (r == 0) break;
+            in->len += r;
+        }
+        in->zs.next_in = in->buf;
+        in->zs.avail_in = in->len;
+        in->pos = in->len;
+    }
+    return in->zs.avail_in >= 2 && in->zs.next_in[0] == 0x1f && in->zs.next_in[1] == 0x8b;
+}
+
+static int input_read_raw(Input *in, void *out, unsigned out_len)
 {
     if (!in->detected) {
         in->detected = true;
@@ -76,9 +100,23 @@ static int input_read(Input *in, void *out, unsigned out_len)
         return r < 0 ? -1 : (int) r;
     }
 
+    if (in->finished) return 0;
     in->zs.next_out = (Bytef *) out;
     in->zs.avail_out = out_len;
     while (in->zs.avail_out == out_len) {
+        if (in->check_next) {
+            // Checked only once the text of the previous member has been
+            // returned, so a pipe that pauses between members does not hold
+            // it back.
+            in->check_next = false;
+            int next = next_is_member(in);
+            if (next < 0) return -1;
+            if (next == 0) {
+                in->finished = true;
+                return 0;
+            }
+            inflateReset(&in->zs);
+        }
         if (in->zs.avail_in == 0) {
             if (in->pos >= in->len) {
                 ssize_t r = raw_read(in->fd, in->buf, sizeof(in->buf));
@@ -97,7 +135,7 @@ static int input_read(Input *in, void *out, unsigned out_len)
         int ret = inflate(&in->zs, Z_NO_FLUSH);
         if (ret == Z_STREAM_END) {
             in->in_member = false;
-            inflateReset(&in->zs);  // another member may follow
+            in->check_next = true;
         }
         else if (ret == Z_OK || ret == Z_BUF_ERROR) {
             in->in_member = true;
@@ -107,6 +145,17 @@ static int input_read(Input *in, void *out, unsigned out_len)
         }
     }
     return (int) (out_len - in->zs.avail_out);
+}
+
+// kseq's read function: up to out_len bytes of text, 0 at the end of the
+// input, -1 on a read error, a corrupt gzip stream or a gzip member cut
+// short. A failure is also recorded, so that FastReader can drop a record
+// that kseq returns after the stream failed part way through it.
+static int input_read(Input *in, void *out, unsigned out_len)
+{
+    int n = input_read_raw(in, out, out_len);
+    if (n < 0) in->failed = true;
+    return n;
 }
 
 // A 64 KB parse buffer (kseq defaults to 16 KB) means fewer read and
@@ -163,6 +212,16 @@ int FastReader::read(Kraken2SequenceRequest& rec) {
             std::cerr << m_filename << ": error reading stream; stopping." << std::endl;
         }
         return rtn;
+    }
+    else if (m_impl->input.failed) {
+        // The stream failed part way through this record (a gzip file cut
+        // short, corrupt data): kseq returns what it had read, which may be
+        // incomplete, so the record is dropped.
+        std::cerr << m_filename << ": error reading stream at record "
+                  << (m_seq->name.s ? m_seq->name.s : "?") << "; stopping." << std::endl;
+        rec.Clear();
+        m_last_status = -3;
+        return -3;
     }
     else {
         // Once a file has given FASTQ records, a record without qualities

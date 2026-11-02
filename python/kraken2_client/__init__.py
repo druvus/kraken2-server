@@ -20,8 +20,9 @@ import os
 import sys
 import threading
 import time
+import zlib
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Optional, Tuple, Union
+from typing import Callable, Iterable, Iterator, Optional, Tuple, Union
 
 import grpc
 
@@ -290,7 +291,8 @@ class Client:
             raise
 
     def classify(self, records: Iterable[Union[Record, PairedRecord]],
-                 report: Optional[io.TextIOBase] = None) -> Iterator[Classification]:
+                 report: Optional[io.TextIOBase] = None,
+                 on_message: Optional[Callable[[], None]] = None) -> Iterator[Classification]:
         """Stream records to the server and yield one Classification per
         record, in input order. If `report` is a writable text stream, the
         kraken2 style report for this stream is written to it at the end.
@@ -306,6 +308,9 @@ class Client:
         first record is FLUSH_SECONDS old, so records that arrive slowly
         (from a running sequencer) are classified as they come rather than
         once a message is full.
+        on_message, if given, is called after the results of each message
+        from the server have been yielded; the command line client uses it
+        to flush its output, so results reach a pipe as they arrive.
         An exception raised by the `records` iterable (for example from
         read_pairs on mismatched inputs) is re-raised after the results for
         the records already sent have been yielded."""
@@ -402,8 +407,10 @@ class Client:
                 if result.HasField("classifications"):
                     for c in result.classifications.classes:
                         in_flight.release()
-                        yield Classification(c.classified, c.id, c.tax_id, c.size, c.hitlist,
-                                             c.paired, c.size2)
+                        yield Classification(c.classified, c.id.decode("utf-8", "surrogateescape"),
+                                             c.tax_id, c.size, c.hitlist, c.paired, c.size2)
+                    if on_message is not None:
+                        on_message()
                 elif result.HasField("summary"):
                     summary.append(result.summary)
         finally:
@@ -426,25 +433,42 @@ def _record_bytes(rec) -> int:
     return n
 
 
+# Read ids, sequences and qualities travel as bytes. Text read from files
+# is decoded with surrogateescape, so a byte that is not UTF-8 is carried
+# through unchanged and comes back the same in the result's read_id.
 def _fill(msg, read_id: str, seq: str, quals: str):
-    msg.id = read_id
-    msg.seq = seq
+    msg.id = read_id.encode("utf-8", "surrogateescape")
+    msg.seq = seq.encode("utf-8", "surrogateescape")
     if quals:
         msg.format = pb.Kraken2SequenceRequest.FORMAT_FASTQ
-        msg.quals = quals
+        msg.quals = quals.encode("utf-8", "surrogateescape")
     else:
         msg.format = pb.Kraken2SequenceRequest.FORMAT_FASTA
 
 
 def _open_text(path: str):
-    if path == "-":
-        return sys.stdin
-    f = open(path, "rb")
-    if f.read(2) == b"\x1f\x8b":
-        f.seek(0)
-        return io.TextIOWrapper(gzip.GzipFile(fileobj=f))
-    f.seek(0)
-    return io.TextIOWrapper(f)
+    """A text stream over a FASTA/FASTQ file, plain or gzipped, and a
+    function that releases what was opened here. Works on inputs that
+    cannot seek (stdin, a named pipe, process substitution): the gzip magic
+    is looked at with peek(), which does not consume it. Standard input
+    is left open."""
+    if path == "-" and not hasattr(sys.stdin, "buffer"):
+        # stdin replaced by a text stream (a test, a notebook)
+        return sys.stdin, lambda: None
+    raw = sys.stdin.buffer if path == "-" else open(path, "rb")
+    head = raw.peek(2)[:2] if hasattr(raw, "peek") else b""
+    binary = gzip.GzipFile(fileobj=raw, mode="rb") if head == b"\x1f\x8b" else raw
+    text = io.TextIOWrapper(binary, encoding="utf-8", errors="surrogateescape")
+
+    def release():
+        if path == "-":
+            text.detach()   # closing the wrapper would close stdin
+            if binary is not raw:
+                binary.close()   # a GzipFile does not close the stream it wraps
+        else:
+            text.close()
+            raw.close()
+    return text, release
 
 
 class _Records:
@@ -469,14 +493,16 @@ def read_fastx(path: str) -> Iterator[Record]:
 
     The file is opened at once, so a missing file raises OSError here
     rather than when the records are first read. A FASTQ record cut short
-    (a truncated file) or a truncated gzip file raises InputError when it
-    is reached. Standard input is left open."""
-    f = _open_text(path)
+    (a truncated file), a truncated or corrupt gzip file, or a read error
+    raises InputError when it is reached. Named pipes and gzip on stdin
+    work. Bytes that are not UTF-8 are kept (decoded with surrogateescape).
+    Standard input is left open."""
+    f, release = _open_text(path)
     may_block = path == "-" or not os.path.isfile(path)
-    return _Records(_fastx_records(f, path, close=f is not sys.stdin), may_block)
+    return _Records(_fastx_records(f, path, release), may_block)
 
 
-def _fastx_records(f, path: str, close: bool) -> Iterator[Record]:
+def _fastx_records(f, path: str, release) -> Iterator[Record]:
     try:
         header = None
         seq_lines = []
@@ -502,12 +528,13 @@ def _fastx_records(f, path: str, close: bool) -> Iterator[Record]:
                 seq_lines.append(line)
         if header is not None:
             yield (header, "".join(seq_lines), "")
-    except EOFError as e:
-        # gzip raises EOFError for a compressed stream that ends early
+    except (EOFError, OSError, zlib.error) as e:
+        # gzip raises EOFError for a compressed stream that ends early,
+        # BadGzipFile (an OSError) for a bad CRC or header, and zlib.error
+        # for corrupt data; a read error is an OSError too.
         raise InputError("%s: %s" % (path, e)) from None
     finally:
-        if close:
-            f.close()
+        release()
 
 
 def read_pairs(path1: str, path2: str) -> Iterator[PairedRecord]:

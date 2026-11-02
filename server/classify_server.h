@@ -129,6 +129,12 @@ public:
     void StartLoading();
 
     /**
+     * @brief Wait for a database load in progress to finish. Afterwards
+     *        index_available or index_broken tells how it went.
+     */
+    void WaitForLoad();
+
+    /**
      * @brief Load kraken2 index options, taxonomy and hash table.
      */
     void LoadIndex();

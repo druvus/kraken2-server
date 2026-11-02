@@ -334,6 +334,53 @@ kill -CONT $SERVER_PID
 wait $SERVER_PID
 trap - EXIT
 
+# Input edge cases: a read id that is not valid UTF-8, a gzip FASTA cut
+# short, gzip with trailing zero padding, and the server's exit status when
+# it is stopped during a load that then succeeds.
+echo "+++ Input edge cases +++"
+EDGE_PORT=$((PORT + 8))
+"$SERVER" --allow-remote-shutdown --db $DB --host-ip 127.0.0.1 --port $EDGE_PORT > $WORK/server_edge.log 2>&1 &
+SERVER_PID=$!
+trap 'kill $SERVER_PID 2> /dev/null' EXIT
+for i in $(seq 1 60); do "$CLIENT" --port $EDGE_PORT --host-ip 127.0.0.1 > /dev/null 2>&1 && break; sleep 1; done
+# read 2001 gets a Latin-1 byte in its id; its batch would not parse as
+# protobuf text, and the server used to take that for the end of the input
+python3 -c "
+import gzip, sys
+lines = gzip.open(sys.argv[1], 'rb').read().split(b'\n')
+lines[2000 * 4] = b'@caf\xe9_' + lines[2000 * 4][1:]
+open(sys.argv[2], 'wb').write(b'\n'.join(lines))
+" $READS $WORK/latin1.fq
+kraken2 --db $DB --threads 4 --minimum-hit-groups 2 --output $WORK/ref_latin1.out $WORK/latin1.fq > /dev/null 2>&1
+"$CLIENT" --port $EDGE_PORT --host-ip 127.0.0.1 --sequence $WORK/latin1.fq > $WORK/latin1.out 2> $WORK/latin1.err
+check "read id that is not UTF-8: client exit code" 0 $?
+check "read id that is not UTF-8: output identical to kraken2" 0 "$(cmp -s $WORK/latin1.out $WORK/ref_latin1.out; echo $?)"
+# a gzip FASTA cut inside a sequence: no line may be printed for the
+# partial record
+gzip -dc $READS | head -40 | awk 'NR%4==1{print ">" substr($1,2)} NR%4==2{print}' > $WORK/ten.fa
+gzip -c $WORK/ten.fa > $WORK/ten.fa.gz
+head -c 4000 $WORK/ten.fa.gz > $WORK/ten_cut.fa.gz
+"$CLIENT" --port $EDGE_PORT --host-ip 127.0.0.1 --sequence $WORK/ten_cut.fa.gz > $WORK/ten_cut.out 2> /dev/null
+check "gzip FASTA cut short exits with EX_IOERR" 74 $?
+check "no result printed for the partial record" 0 "$(awk 'NR==FNR{if (/^>/) id=substr($1,2); else len[id]=length($0); next} $4 != len[$2]' $WORK/ten.fa $WORK/ten_cut.out | wc -l | tr -d ' ')"
+# zero padding after the last gzip member, as some tools write; gzip(1)
+# and zlib accept it
+cp $READS $WORK/padded.fq.gz
+head -c 512 /dev/zero >> $WORK/padded.fq.gz
+"$CLIENT" --port $EDGE_PORT --host-ip 127.0.0.1 --sequence $WORK/padded.fq.gz > $WORK/padded.out 2> /dev/null
+check "gzip with trailing zero padding exit code" 0 $?
+check "gzip with trailing zero padding identical to kraken2" 0 "$(diff $WORK/padded.out $WORK/ref_single.out | grep -c '^[<>]')"
+"$CLIENT" --port $EDGE_PORT --host-ip 127.0.0.1 --shutdown > /dev/null 2>&1
+wait $SERVER_PID
+trap - EXIT
+# stopped during a load that succeeds: a normal shutdown
+"$SERVER" --db $DB --host-ip 127.0.0.1 --port $EDGE_PORT --wait 5 > $WORK/server_int.log 2>&1 &
+INT_PID=$!
+sleep 1
+kill -INT $INT_PID
+wait $INT_PID
+check "SIGINT during a load that succeeds exits 0" 0 $?
+
 # Translated search against a tiny synthetic protein database, built on
 # first use by make_protein_db.sh (needs kraken2-build and python3).
 PROT_DB=tinyprot

@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Fixed
+- A read id containing a byte that is not valid UTF-8 cut the stream
+  short: the request fields were protobuf `string`s, which protobuf refuses
+  to parse unless they are UTF-8, and the server took the unparsable
+  message for the end of the input. The id, sequence and quality fields
+  (and the result's id) are now `bytes`, which are the same on the wire,
+  so older clients and servers still work together. Ids are passed through
+  byte for byte by both clients.
+- `kraken2_client` printed a shortened last record when a gzip FASTA file
+  was cut short or corrupt inside a sequence. A record read while the
+  input failed is now dropped, so every printed line is a complete result.
+- `kraken2_client` rejected a gzip file with trailing data after the last
+  member, such as zero padding, with exit 74 after classifying it. As with
+  zlib's `gzread` and kraken2, trailing data that is not another gzip
+  member now ends the input.
+- `k2client` held its output back when writing to a pipe, so results did
+  not arrive as they were classified. It now flushes after each message
+  from the server; `Client.classify()` takes an `on_message` callback for
+  this.
+- `k2client` could not read named pipes or process substitution (`-s
+  <(zcat reads.fq.gz)`, "not seekable") or gzip on standard input. Input is
+  now opened in binary and the gzip magic is checked without consuming it.
+  A corrupt gzip file (bad CRC or data) is reported as an input error
+  (exit 74) instead of an output error or a traceback.
+- The server exited 74, reserved for a database that failed to load, when
+  it was stopped during a load that then succeeded. It now waits for the
+  load and exits 0.
+
 ## [v0.2.2] - 2026-11-02
 ### Fixed
 - A stream hung forever with very long reads (about 30 Mb and more, such as

@@ -41,11 +41,14 @@ message Kraken2SequenceRequest {
   SequenceFormat format = 1;
   // Full header line. Not used by the server and no longer sent.
   string header = 2 [deprecated = true];
-  // Read name up to the first whitespace.
-  string id = 3;
-  string seq = 4;
+  // Read name up to the first whitespace. id, seq and quals are bytes rather
+  // than string (the two are the same on the wire) because read names are
+  // not always valid UTF-8, and protobuf refuses to parse a string field
+  // that is not.
+  bytes id = 3;
+  bytes seq = 4;
   // Quality string, FASTQ only. Must match seq in length.
-  string quals = 5;
+  bytes quals = 5;
   // Text rendering of the record. Not used by the server and no longer sent.
   string str_representation = 6 [deprecated = true];
   // Second read of a pair. Absent for single-end reads. When present the
@@ -59,7 +62,8 @@ message Kraken2SequenceRequestMulti {
 
 // - Classification result
 message Kraken2SequenceResult {
-  string id = 1;
+  // The request's id (with /1 or /2 removed for a pair), byte for byte.
+  bytes id = 1;
   bool classified = 2;
   // External (NCBI) taxonomy id of the call, 0 when unclassified.
   uint64 tax_id = 3;
