@@ -106,6 +106,14 @@ k-mer and distinct k-mer columns.
 Short options are accepted in either case (`-d` or `-D`). `--translated-search`
 is accepted for compatibility; protein databases are detected from `opts.k2d`.
 
+Ctrl-C, SIGTERM or `kraken2_client --shutdown` stop the server. Open
+streams get 10 seconds to finish and are then cancelled; a second signal
+exits at once, also while the database is still loading. The server
+exits with 0 after a shutdown, 69 if it cannot listen on the address
+(for example, the port is in use), 78 if the TLS files cannot be read,
+and 74 if the database failed to load. Startup errors are reported before
+the database is loaded.
+
 ### Client options
 
 | option | meaning |
